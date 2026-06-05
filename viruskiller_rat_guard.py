@@ -8,7 +8,6 @@ samples into reversible quarantine.
 """
 
 import ast
-import builtins
 import hashlib
 import json
 import os
@@ -187,24 +186,6 @@ def _save_state():
         _atomic_write_json(_state_path(), _state)
     except Exception as exc:
         _log(f"state save skipped: {exc}")
-
-
-def _restore_stale_compile_hook():
-    # Old VirusKiller builds patched builtins.compile globally and broke plugin install.
-    # This module never patches compile(); it only unwraps that stale hook if present.
-    try:
-        current = builtins.compile
-        if getattr(current, "__name__", "") != "_patched_compile":
-            return False
-        original = getattr(current, "__globals__", {}).get("_original_compile")
-        if callable(original) and original is not current:
-            builtins.compile = original
-            _log("stale VirusKiller compile hook removed")
-            _notify("Установка плагинов разблокирована", error=False)
-            return True
-    except Exception as exc:
-        _log(f"compile restore skipped: {exc}")
-    return False
 
 
 def _notify(message, error=False):
@@ -549,7 +530,6 @@ def _quarantine(path, result):
 
 
 def scan_once():
-    _restore_stale_compile_hook()
     findings = 0
     quarantined = 0
     scanned = 0
@@ -605,7 +585,6 @@ def start(config=None):
     global _started, _worker, _config
     with _lock:
         _config = dict(config or {})
-        _restore_stale_compile_hook()
         _load_state()
         if _started and _worker and _worker.is_alive():
             return True
