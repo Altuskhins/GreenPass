@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -32,7 +34,8 @@ const (
 	stateStopped   = "stopped"
 	stateError     = "error"
 
-	maxCoreLogEntries = 100
+	maxCoreLogEntries     = 100
+	persistentLogMaxBytes = 262144
 )
 
 // Listener receives logs and lifecycle state changes from mobilebridge.
@@ -87,6 +90,8 @@ type olcRTCConfig struct {
 	LivenessFailures       int `json:"liveness_failures"`
 
 	WaitReadyTimeoutMillis int `json:"wait_ready_timeout_millis"`
+
+	LogPath string `json:"log_path"`
 }
 
 type startWithTransportFunc func(
@@ -112,6 +117,9 @@ var (
 	diagnosticsMu sync.RWMutex
 	coreStatus    = statusSnapshot{State: stateStopped}
 	coreLogs      = make([]logEntry, 0, maxCoreLogEntries)
+
+	persistentLogMu   sync.Mutex
+	persistentLogPath string
 
 	mobileStartWithTransport = startWithTransportFunc(olcmobile.StartWithTransport)
 	mobileWaitReady          = olcmobile.WaitReady
@@ -235,6 +243,7 @@ func Start(configJson string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	setPersistentLogPath(cfg.LogPath)
 	_, cancel := context.WithCancel(context.Background())
 	return startRunner(cancel, &olcRTCRunner{cfg: cfg})
 }
@@ -271,6 +280,7 @@ func StartOlcRTCWithClient(
 	if err := cfg.normalizeAndValidate(); err != nil {
 		return "", err
 	}
+	setPersistentLogPath(cfg.LogPath)
 	_, cancel := context.WithCancel(context.Background())
 	return startRunner(cancel, &olcRTCRunner{cfg: cfg})
 }
@@ -361,6 +371,8 @@ func StartSingle(configJson string) error {
 		singleMu.Unlock()
 		return err
 	}
+	setPersistentLogPath(cfg.LogPath)
+	emitLog("", "info", "StartSingle config accepted")
 
 	_ = StopSingle()
 
@@ -498,6 +510,7 @@ func (c *olcRTCConfig) normalizeAndValidate() error {
 	c.KeyHex = strings.TrimSpace(c.KeyHex)
 	c.SocksListenHost = strings.TrimSpace(c.SocksListenHost)
 	c.DNSServer = strings.TrimSpace(c.DNSServer)
+	c.LogPath = strings.TrimSpace(c.LogPath)
 
 	if c.Carrier == "" {
 		return errors.New("carrier is required")
@@ -526,22 +539,59 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func maskKeyHex(keyHex string) string {
+	trimmed := strings.TrimSpace(keyHex)
+	if trimmed == "" {
+		return ""
+	}
+	if len(trimmed) <= 12 {
+		return "***"
+	}
+	return trimmed[:6] + "..." + trimmed[len(trimmed)-6:]
+}
+
 type olcRTCRunner struct {
 	cfg       olcRTCConfig
 	sessionID string
 }
 
 func (r *olcRTCRunner) Start() error {
+	emitLog(
+		r.sessionID,
+		"info",
+		fmt.Sprintf(
+			"runner start carrier=%s transport=%s room=%s client=%s key=%s socks_port=%d",
+			r.cfg.Carrier,
+			r.cfg.Transport,
+			r.cfg.RoomID,
+			r.cfg.ClientID,
+			maskKeyHex(r.cfg.KeyHex),
+			r.cfg.SocksPort,
+		),
+	)
 	if r.cfg.DNSServer != "" {
+		emitLog(r.sessionID, "info", fmt.Sprintf("set dns %s", r.cfg.DNSServer))
 		mobileSetDNS(r.cfg.DNSServer)
 	}
 	if r.cfg.SocksListenHost != "" {
+		emitLog(r.sessionID, "info", fmt.Sprintf("set socks listen host %s", r.cfg.SocksListenHost))
 		mobileSetSocksListenHost(r.cfg.SocksListenHost)
 	}
 	if r.cfg.VP8FPS > 0 || r.cfg.VP8BatchSize > 0 {
+		emitLog(r.sessionID, "info", fmt.Sprintf("set vp8 fps=%d batch=%d", r.cfg.VP8FPS, r.cfg.VP8BatchSize))
 		mobileSetVP8Options(r.cfg.VP8FPS, r.cfg.VP8BatchSize)
 	}
 	if r.cfg.LivenessIntervalMillis > 0 || r.cfg.LivenessTimeoutMillis > 0 || r.cfg.LivenessFailures > 0 {
+		emitLog(
+			r.sessionID,
+			"info",
+			fmt.Sprintf(
+				"set liveness interval=%d timeout=%d failures=%d",
+				r.cfg.LivenessIntervalMillis,
+				r.cfg.LivenessTimeoutMillis,
+				r.cfg.LivenessFailures,
+			),
+		)
 		mobileSetLivenessOptions(
 			r.cfg.LivenessIntervalMillis,
 			r.cfg.LivenessTimeoutMillis,
@@ -549,6 +599,7 @@ func (r *olcRTCRunner) Start() error {
 		)
 	}
 
+	emitLog(r.sessionID, "info", "mobileStartWithTransport enter")
 	if err := mobileStartWithTransport(
 		r.cfg.Carrier,
 		r.cfg.Transport,
@@ -559,21 +610,28 @@ func (r *olcRTCRunner) Start() error {
 		r.cfg.SocksUser,
 		r.cfg.SocksPass,
 	); err != nil {
+		emitLog(r.sessionID, "error", fmt.Sprintf("mobileStartWithTransport error: %v", err))
 		return err
 	}
+	emitLog(r.sessionID, "info", "mobileStartWithTransport returned")
 	emitState(r.sessionID, stateHandshake, "waiting for WebRTC and local SOCKS")
 	if r.cfg.WaitReadyTimeoutMillis > 0 {
+		emitLog(r.sessionID, "info", fmt.Sprintf("WaitReady enter timeout_ms=%d", r.cfg.WaitReadyTimeoutMillis))
 		if err := mobileWaitReady(r.cfg.WaitReadyTimeoutMillis); err != nil {
+			emitLog(r.sessionID, "error", fmt.Sprintf("WaitReady error: %v", err))
 			mobileStop()
 			return err
 		}
+		emitLog(r.sessionID, "info", "WaitReady returned")
 		emitState(r.sessionID, stateReady, "local SOCKS ready")
 	}
 	return nil
 }
 
 func (r *olcRTCRunner) Stop() error {
+	emitLog(r.sessionID, "info", "mobileStop enter")
 	mobileStop()
+	emitLog(r.sessionID, "info", "mobileStop returned")
 	return nil
 }
 
@@ -629,6 +687,9 @@ func rememberDiagnosticLog(sessionID, level, message, state string) {
 		coreLogs = append([]logEntry(nil), coreLogs[len(coreLogs)-maxCoreLogEntries:]...)
 	}
 	diagnosticsMu.Unlock()
+	if shouldPersistLogEntry(entry) {
+		writePersistentLog(entry)
+	}
 }
 
 func rememberDiagnosticState(sessionID, state, message string) {
@@ -667,6 +728,93 @@ func rememberLog(logLevel, message string) {
 		lastError = text
 	}
 	lastMu.Unlock()
+}
+
+func setPersistentLogPath(logPath string) {
+	trimmed := strings.TrimSpace(logPath)
+	persistentLogMu.Lock()
+	persistentLogPath = trimmed
+	persistentLogMu.Unlock()
+	if trimmed != "" {
+		writePersistentLog(logEntry{
+			TimestampMillis: time.Now().UnixMilli(),
+			Level:           "info",
+			Message:         "persistent log enabled",
+		})
+	}
+}
+
+func shouldPersistLogEntry(entry logEntry) bool {
+	level := strings.ToLower(strings.TrimSpace(entry.Level))
+	state := strings.ToLower(strings.TrimSpace(entry.State))
+	message := strings.TrimSpace(entry.Message)
+	if level == "error" || level == "warn" || level == "warning" || state != "" {
+		return true
+	}
+	if strings.Contains(message, " tunnel to ") && strings.Contains(message, "sid=") {
+		return false
+	}
+	return true
+}
+
+func writePersistentLog(entry logEntry) {
+	persistentLogMu.Lock()
+	logPath := persistentLogPath
+	persistentLogMu.Unlock()
+	if strings.TrimSpace(logPath) == "" {
+		return
+	}
+	if entry.TimestampMillis == 0 {
+		entry.TimestampMillis = time.Now().UnixMilli()
+	}
+	if strings.TrimSpace(entry.Level) == "" {
+		entry.Level = "info"
+	}
+	record := map[string]any{
+		"ms":      entry.TimestampMillis,
+		"ts":      time.UnixMilli(entry.TimestampMillis).Format("2006-01-02 15:04:05"),
+		"level":   strings.ToLower(strings.TrimSpace(entry.Level)),
+		"message": strings.TrimSpace(entry.Message),
+	}
+	if strings.TrimSpace(entry.SessionID) != "" {
+		record["session_id"] = strings.TrimSpace(entry.SessionID)
+	}
+	if strings.TrimSpace(entry.State) != "" {
+		record["state"] = strings.TrimSpace(entry.State)
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return
+	}
+	persistentLogMu.Lock()
+	defer persistentLogMu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		return
+	}
+	rotatePersistentLogLocked(logPath)
+	fileHandle, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	defer fileHandle.Close()
+	_, _ = fileHandle.Write(append(data, '\n'))
+	_ = fileHandle.Sync()
+}
+
+func rotatePersistentLogLocked(logPath string) {
+	info, err := os.Stat(logPath)
+	if err != nil || info.Size() <= persistentLogMaxBytes {
+		return
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return
+	}
+	tailSize := persistentLogMaxBytes / 2
+	if len(data) > tailSize {
+		data = data[len(data)-tailSize:]
+	}
+	_ = os.WriteFile(logPath, append([]byte("...truncated...\n"), data...), 0o600)
 }
 
 func rememberState(state, message string) {
