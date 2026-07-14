@@ -1,0 +1,55 @@
+name: Build libgreenpass
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "libgreenpass-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    defaults:
+      run:
+        shell: pwsh -NoProfile -Command ". '{0}'"
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: sing-box-extended/go.mod
+          cache: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - uses: android-actions/setup-android@v4
+
+      - name: Install Android NDK r29
+        run: sdkmanager "ndk;29.0.14206865"
+
+      - name: Build and package both ABIs
+        run: |
+          $sdkRoot = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { $env:ANDROID_HOME }
+          $ndk = Join-Path $sdkRoot "ndk\29.0.14206865"
+          & .\sing-box-extended\scripts\build-release.ps1 -AndroidNdk $ndk
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libgreenpass-${{ github.ref_name }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          path: |
+            GreenPass.plugin
+            libgreenpass.so.xz
+            libgreenpass-armeabi-v7a.so.xz

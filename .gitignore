@@ -1,0 +1,4 @@
+sing-box-extended/build/
+sing-box-extended/**/cache.db
+turnlib/build/
+proxy-turn-vk-android/go_client/test_bin
