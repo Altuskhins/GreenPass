@@ -15,6 +15,9 @@ func TestConfigEngine(t *testing.T) {
 	if got := configEngine(`{"engine":"olcrtc"}`); got != EngineOlcRTC {
 		t.Fatalf("olcrtc config detected as %q", got)
 	}
+	if got := configEngine(`{"engine":"mihomo"}`); got != EngineMihomo {
+		t.Fatalf("mihomo config detected as %q", got)
+	}
 	if got := configEngine(`{"engine":"qwdtt"}`); got != EngineQWDTT {
 		t.Fatalf("qwdtt config detected as %q", got)
 	}

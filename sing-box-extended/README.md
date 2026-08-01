@@ -1,9 +1,11 @@
 # sing-box-extended
 
-Unified Android C-ABI core for GreenPass. It builds one `libgreenpass.so`
-(arm64-v8a) containing [shtorm-7/sing-box-extended](https://github.com/shtorm-7/sing-box-extended)
+Unified Android C-ABI core for GreenPass. It builds one `libgreenpass.so` per
+supported ABI (arm64-v8a and armeabi-v7a) containing [shtorm-7/sing-box-extended](https://github.com/shtorm-7/sing-box-extended)
 with AmneziaWG 2.0 support and the local `turnlib` olcRTC engine. All modes share
 one Go runtime and can switch in-process through the existing `VlessCore` ABI.
+Mihomo is built into that same library, so selecting it never loads a second Go
+runtime into ExteraGram.
 
 ## Layout
 
@@ -12,7 +14,8 @@ sing-box-extended/
 ├── go.mod / go.sum        # pins sing-box-extended v1.13.14-extended-2.5.0
 ├── cbridge/main.go        # C-ABI exports (//export StartCore / StopCore / ...)
 ├── mobilebridge/          # single-session wrapper around box.Box
-├── unifiedbridge/         # routes olcRTC configs; all others use sing-box
+├── mihomobridge/          # sanitized Mihomo local-proxy lifecycle
+├── unifiedbridge/         # routes sing-box, Mihomo, olcRTC and qWDTT configs
 ├── scripts/
 │   └── build-cabi-android.ps1  # NDK cross-compile (mirrors turnlib)
 └── build/cabi/arm64-v8a/  # output: libgreenpass.so + libgreenpass.h
@@ -32,13 +35,15 @@ caller frees every returned string with `FreeCString`):
 | `LastError`     | `char* LastError()`                         | `core.last_error()` |
 | `GetStatusJSON` | `char* GetStatusJSON()`                     | `core.status_json()` |
 | `GetLogsJSON`   | `char* GetLogsJSON()`                       | `core.logs_json()` |
+| `CurrentEngine` | `char* CurrentEngine()`                     | active engine diagnostics |
 | `IsRunning`     | `int IsRunning()`                           | extra (not required by VlessCore) |
 | `Version`       | `char* Version()`                           | extra |
 | `ValidateConfig`| `char* ValidateConfig(char* configJSON)`    | extra |
 
-`StartCore` routes configs with top-level `"engine":"olcrtc"` to turnlib and
-all other configs to sing-box. It stops the current engine before starting the
-next one, preserving a single active session in the shared Go runtime.
+`StartCore` routes configs by the top-level `engine` field. Mihomo receives a
+small JSON envelope containing either its YAML config or proxy links. The bridge
+forces one authenticated loopback mixed listener and disables imported TUN,
+LAN, controller and server listeners before applying the config.
 
 ## Build
 
@@ -53,7 +58,8 @@ $env:ANDROID_NDK_HOME = "D:\sdkandroidstudio\android-ndk-r29"
 .\scripts\build-cabi-android.ps1
 ```
 
-Output: `build/cabi/arm64-v8a/libgreenpass.so` (+ `libgreenpass.h`).
+Output: `build/cabi/<abi>/libgreenpass.so` (+ `libgreenpass.h`). Use
+`build-release.ps1` to build and package both ABIs and update GreenPass hashes.
 
 The script uses `go build -buildmode=c-shared` with the NDK clang toolchain
 (`aarch64-linux-android24-clang`), exactly like `turnlib/scripts/build-cabi-android.ps1`.
@@ -84,11 +90,11 @@ with a jsDelivr CDN fallback.
 ## Test
 
 ```powershell
-go test -tags with_clash_api ./mobilebridge ./unifiedbridge
+go test -tags with_clash_api ./mihomobridge ./mobilebridge ./unifiedbridge
 ```
 
-Exercises the real sing-box lifecycle: config parse -> `box.New` -> `Start` ->
-`Close`, single-session replacement, idempotent stop, and the diagnostics ring.
+Exercises the real sing-box lifecycle plus Mihomo envelope/link conversion and
+unified engine dispatch.
 The release script separately cross-compiles the complete Android tag set,
 including the Android-only Naive/Cronet implementation.
 
@@ -96,15 +102,14 @@ including the Android-only Naive/Cronet implementation.
 
 - Drop `libgreenpass.so` into the GreenPass modules folder. VLESS, AWG and
   olcRTC all load that same path through the exported `VlessCore` contract.
-- Config is **sing-box JSON**, not xray JSON. GreenPass's `_build_*_config`
-  helpers already emit xray-shaped JSON; a sing-box config builder lives in
-  `mobilebridge`-adjacent code if you want to reuse the same URI parsers.
-  The config schema differs (e.g. `"type": "mixed"` inbound vs xray's
-  `"protocol": "socks"`), so feed sing-box-shaped configs only.
+- GreenPass can send sing-box JSON, a Mihomo envelope containing proxy links,
+  or a raw Mihomo YAML/JSON config imported as `.mihomo`. The bridge selects the
+  engine from the envelope and keeps one authenticated loopback listener.
 - `StartCore` returns `""` on success and `"error: ..."` on failure, matching
   the `VlessCore.start()` convention where non-empty means error.
 
 ## License
 
-This bridge links sing-box. Check sing-box's LICENSE before distributing the
-built `.so`.
+This bridge links sing-box and GPL-3.0-licensed Mihomo. Distributions of the
+built `.so` must satisfy both upstream licenses; Mihomo's license text is kept
+in `licenses/Mihomo-GPL-3.0.txt`.

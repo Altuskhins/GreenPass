@@ -1,0 +1,43 @@
+diff --git a/mobile/mobile.go b/mobile/mobile.go
+index 13e8c64..73ee42c 100644
+--- a/mobile/mobile.go
++++ b/mobile/mobile.go
+@@ -55,6 +55,7 @@ var (
+ const (
+ 	defaultTransport   = "vp8channel"
+ 	dataTransport      = "datachannel"
++	seiTransport       = "seichannel"
+ 	defaultDNSServer   = "8.8.8.8:53"
+ 	defaultHTTPPingURL = "https://www.google.com/generate_204"
+ 	defaultSocksHost   = "127.0.0.1"
+@@ -117,7 +118,7 @@ func SetProviders() {
+ }
+ 
+ // SetTransport selects the transport used by Start.
+-// Supported values: vp8channel and datachannel.
++// Supported values: vp8channel, datachannel and seichannel.
+ func SetTransport(transport string) {
+ 	mu.Lock()
+ 	defer mu.Unlock()
+@@ -782,6 +783,8 @@ func normalizeTransport(value string) string {
+ 		return dataTransport
+ 	case defaultTransport, "vp8":
+ 		return defaultTransport
++	case seiTransport, "sei":
++		return seiTransport
+ 	default:
+ 		return defaultTransport
+ 	}
+diff --git a/mobile/mobile_test.go b/mobile/mobile_test.go
+index f40fe52..192cd8f 100644
+--- a/mobile/mobile_test.go
++++ b/mobile/mobile_test.go
+@@ -115,6 +115,8 @@ func TestNormalizeBuildRoomAndClamp(t *testing.T) {
+ 		"dc":          dataTransport,
+ 		"vp8channel":  defaultTransport,
+ 		"vp8":         defaultTransport,
++		"seichannel":  seiTransport,
++		"sei":         seiTransport,
+ 		"bad":         defaultTransport,
+ 	}
+ 	for in, want := range tests {

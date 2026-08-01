@@ -7,12 +7,14 @@ import (
 	"sync"
 
 	olcrtc "combinedtunnel/mobilebridge"
+	mihomo "singboxextended/mihomobridge"
 	singbox "singboxextended/mobilebridge"
 	qwdtt "singboxextended/qwdttbridge"
 )
 
 const (
 	EngineSingBox = "singbox"
+	EngineMihomo  = "mihomo"
 	EngineOlcRTC  = "olcrtc"
 	EngineQWDTT   = "qwdtt"
 )
@@ -32,6 +34,8 @@ func configEngine(configJSON string) string {
 		switch strings.ToLower(strings.TrimSpace(header.Engine)) {
 		case EngineOlcRTC:
 			return EngineOlcRTC
+		case EngineMihomo:
+			return EngineMihomo
 		case EngineQWDTT:
 			return EngineQWDTT
 		}
@@ -41,9 +45,9 @@ func configEngine(configJSON string) string {
 
 func Start(configJSON string) error {
 	engine := configEngine(configJSON)
-	if engine == EngineQWDTT {
-		// Validate before replacing a working qWDTT session.
-		if err := qwdtt.ValidateConfig(configJSON); err != nil {
+	if engine == EngineQWDTT || engine == EngineMihomo {
+		// Validate before replacing a working session.
+		if err := ValidateConfig(configJSON); err != nil {
 			return err
 		}
 	}
@@ -83,6 +87,9 @@ func Start(configJSON string) error {
 	if engine == EngineOlcRTC {
 		return olcrtc.StartSingle(configJSON)
 	}
+	if engine == EngineMihomo {
+		return mihomo.Start(configJSON)
+	}
 	return singbox.StartSingle(configJSON)
 }
 
@@ -97,11 +104,15 @@ func stopLocked() error {
 	qwdttErr := qwdtt.StopSingle()
 	singErr := singbox.StopSingle()
 	olcErr := olcrtc.StopSingle()
+	mihomoErr := mihomo.Stop()
 	if qwdttErr != nil {
 		return qwdttErr
 	}
 	if singErr != nil {
 		return singErr
+	}
+	if mihomoErr != nil {
+		return mihomoErr
 	}
 	return olcErr
 }
@@ -109,6 +120,9 @@ func stopLocked() error {
 func currentEngineLocked() string {
 	if qwdtt.SingleRunning() {
 		return EngineQWDTT
+	}
+	if mihomo.SingleRunning() {
+		return EngineMihomo
 	}
 	if olcrtc.SingleRunning() {
 		return EngineOlcRTC
@@ -126,6 +140,9 @@ func stopEngineLocked(engine string) error {
 	if engine == EngineOlcRTC {
 		return olcrtc.StopSingle()
 	}
+	if engine == EngineMihomo {
+		return mihomo.Stop()
+	}
 	if engine == EngineSingBox {
 		return singbox.StopSingle()
 	}
@@ -135,7 +152,7 @@ func stopEngineLocked(engine string) error {
 func IsRunning() bool {
 	mu.Lock()
 	defer mu.Unlock()
-	return qwdtt.SingleRunning() || singbox.SingleRunning() || olcrtc.SingleRunning()
+	return qwdtt.SingleRunning() || mihomo.SingleRunning() || singbox.SingleRunning() || olcrtc.SingleRunning()
 }
 
 func CurrentEngine() string {
@@ -143,6 +160,9 @@ func CurrentEngine() string {
 	defer mu.Unlock()
 	if qwdtt.SingleRunning() {
 		return EngineQWDTT
+	}
+	if mihomo.SingleRunning() {
+		return EngineMihomo
 	}
 	if olcrtc.SingleRunning() {
 		return EngineOlcRTC
@@ -154,6 +174,9 @@ func CurrentEngine() string {
 }
 
 func ValidateConfig(configJSON string) error {
+	if configEngine(configJSON) == EngineMihomo {
+		return mihomo.ValidateConfig(configJSON)
+	}
 	if configEngine(configJSON) == EngineOlcRTC {
 		return olcrtc.ValidateConfig(configJSON)
 	}
@@ -164,10 +187,13 @@ func ValidateConfig(configJSON string) error {
 }
 
 func Version() string {
-	return fmt.Sprintf("greenpass sing-box/%s olcrtc/%s qwdtt/%s", singbox.Version(), olcrtc.Version(), qwdtt.Version())
+	return fmt.Sprintf("greenpass sing-box/%s mihomo/%s olcrtc/%s qwdtt/%s", singbox.Version(), mihomo.Version(), olcrtc.Version(), qwdtt.Version())
 }
 
 func LastLog() string {
+	if CurrentEngine() == EngineMihomo {
+		return mihomo.LastLog()
+	}
 	if CurrentEngine() == EngineQWDTT {
 		return qwdtt.LastLog()
 	}
@@ -178,6 +204,9 @@ func LastLog() string {
 }
 
 func LastError() string {
+	if CurrentEngine() == EngineMihomo {
+		return mihomo.LastError()
+	}
 	if CurrentEngine() == EngineQWDTT {
 		return qwdtt.LastError()
 	}
@@ -188,6 +217,9 @@ func LastError() string {
 }
 
 func StatusJSON() string {
+	if CurrentEngine() == EngineMihomo {
+		return mihomo.StatusJSON()
+	}
 	if CurrentEngine() == EngineQWDTT {
 		return qwdtt.StatusJSON()
 	}
@@ -198,6 +230,9 @@ func StatusJSON() string {
 }
 
 func LogsJSON() string {
+	if CurrentEngine() == EngineMihomo {
+		return mihomo.LogsJSON()
+	}
 	if CurrentEngine() == EngineQWDTT {
 		return qwdtt.LogsJSON()
 	}

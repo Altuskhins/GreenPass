@@ -17,8 +17,8 @@ $targets = @(
 
 Push-Location $projectRoot
 try {
-    go test -tags with_clash_api ./mobilebridge ./unifiedbridge
-    if ($LASTEXITCODE -ne 0) { throw "mobilebridge tests failed" }
+    go test -tags with_clash_api ./mihomobridge ./mobilebridge ./unifiedbridge
+    if ($LASTEXITCODE -ne 0) { throw "bridge tests failed" }
 
     if (-not $SkipBuild) {
         foreach ($target in $targets) {

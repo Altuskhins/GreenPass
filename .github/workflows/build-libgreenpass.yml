@@ -23,6 +23,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Apply GreenPass olcRTC transport patch
+        run: git -C turnlib/olcrtc apply ../patches/olcrtc-seichannel.patch
+
       - uses: actions/setup-go@v6
         with:
           go-version-file: sing-box-extended/go.mod
