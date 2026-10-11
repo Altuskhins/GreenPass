@@ -11,6 +11,14 @@ Targets the current [exteraGram plugin SDK](https://plugins.exteragram.app/docs)
 | Elyx (`.eaf`) | `>=12.5.1` | `>=1.4.5.3` | `plugin/meta.yml` |
 | Legacy (`.plugin`) | `>=12.5.1` | `>=1.4.5.3` | top of `plugin/greenpass/foundation.py` |
 
+## Runtime dependencies
+
+The Elyx archive bundles the pinned, pure-Python HTTPX and HTTP/2 wheels under
+`plugin/wheels`. Elyx installs them in GreenPass's private library directory,
+so users do not need to install packages from PyPI. The legacy single-file
+plugin keeps HTTP/2 optional and falls back to WebSocket when those libraries
+are unavailable.
+
 ## Build on Windows
 
 Run `build.bat` (needs Python 3.10+, ideally 3.11). It installs ElyxBuilder and

@@ -1,3 +1,4 @@
 metainfo: plugin/meta.yml
 main: plugin/main.py
 elyxbuilder: plugin/.elyxbuilder
+wheels: plugin/wheels
