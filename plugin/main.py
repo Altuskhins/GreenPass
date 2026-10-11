@@ -21,6 +21,11 @@ __app_version__ = _foundation.__app_version__
 __sdk_version__ = _foundation.__sdk_version__
 
 class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcModeMixin, TgWsModeMixin, BasePlugin):
+    def create_settings(self):
+        # Keep the public SDK entry point on the concrete plugin class. Some
+        # client builds only expose settings methods declared directly here.
+        return SettingsUiMixin.create_settings(self)
+
     def __init__(self):
         super().__init__()
         self.name = _foundation.__name__
@@ -981,23 +986,77 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 pass
         return False
 
-    def _fetch_plugin_update_text(self):
+    def _fetch_greenpass_release_asset(self, asset_name, max_size=2 * 1024 * 1024):
         try:
-            req = urllib.request.Request(str(GREENPASS_UPDATE_URL), headers={"User-Agent": "GreenPass-Updater"})
-            with urllib.request.urlopen(req, timeout=20, context=ssl.create_default_context()) as resp:
-                raw = resp.read(2 * 1024 * 1024 + 1)
-            if len(raw) > 2 * 1024 * 1024:
-                return ""
-            return raw.decode("utf-8", errors="strict")
+            headers = {
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "GreenPass-Updater",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+            request = urllib.request.Request(str(GREENPASS_RELEASES_LATEST_URL), headers=headers)
+            with urllib.request.urlopen(request, timeout=20, context=ssl.create_default_context()) as response:
+                release_raw = response.read(512 * 1024 + 1)
+            if len(release_raw) > 512 * 1024:
+                return b"", ""
+
+            release = json.loads(release_raw.decode("utf-8", errors="strict"))
+            if not isinstance(release, dict) or release.get("draft") or release.get("prerelease"):
+                return b"", ""
+            tag = str(release.get("tag_name", "") or "").strip()
+            version = tag[1:] if tag[:1].lower() == "v" else tag
+            if not version or not isinstance(release.get("assets"), list):
+                return b"", ""
+
+            asset = None
+            for candidate in release.get("assets", []):
+                if isinstance(candidate, dict) and str(candidate.get("name", "") or "") == str(asset_name):
+                    asset = candidate
+                    break
+            if asset is None:
+                return b"", ""
+
+            expected_size = int(asset.get("size", 0) or 0)
+            download_url = str(asset.get("browser_download_url", "") or "")
+            expected_prefix = "https://github.com/Altuskhins/GreenPass/releases/download/"
+            if expected_size < 1024 or expected_size > int(max_size) or not download_url.startswith(expected_prefix):
+                return b"", ""
+
+            request = urllib.request.Request(download_url, headers={
+                "Accept": "application/octet-stream",
+                "User-Agent": "GreenPass-Updater",
+            })
+            with urllib.request.urlopen(request, timeout=30, context=ssl.create_default_context()) as response:
+                raw = response.read(int(max_size) + 1)
+            if len(raw) != expected_size:
+                return b"", ""
+
+            digest = str(asset.get("digest", "") or "").strip().lower()
+            if digest.startswith("sha256:"):
+                if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), digest[7:]):
+                    return b"", ""
+            return raw, version
         except:
-            return ""
+            return b"", ""
+
+    def _fetch_plugin_update_text(self):
+        raw, release_version = self._fetch_greenpass_release_asset("GreenPass.plugin")
+        if not raw or not release_version:
+            return "", ""
+        try:
+            source = raw.decode("utf-8", errors="strict")
+            source_id = re.search(r'(?m)^__id__\s*=\s*["\']([^"\']+)["\']', source)
+            source_version = _extract_declared_plugin_version(source)
+            if (not source_id or str(source_id.group(1) or "").strip() != __id__
+                    or not source_version or source_version != release_version):
+                return "", ""
+            return source, release_version
+        except:
+            return "", ""
 
     def _fetch_elyx_update_archive(self):
         try:
-            req = urllib.request.Request(str(GREENPASS_ELYX_UPDATE_URL), headers={"User-Agent": "GreenPass-Updater"})
-            with urllib.request.urlopen(req, timeout=20, context=ssl.create_default_context()) as resp:
-                raw = resp.read(2 * 1024 * 1024 + 1)
-            if len(raw) < 1024 or len(raw) > 2 * 1024 * 1024:
+            raw, release_version = self._fetch_greenpass_release_asset("GreenPass.elyx")
+            if not raw or not release_version:
                 return b"", ""
             with zipfile.ZipFile(io.BytesIO(raw), "r") as archive:
                 names = set(archive.namelist())
@@ -1009,9 +1068,10 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 meta = archive.read(info).decode("utf-8", errors="strict")
             plugin_id = re.search(r'(?mi)^id\s*:\s*["\']?([^"\'\s]+)', meta)
             version = re.search(r'(?mi)^version\s*:\s*["\']?([^"\'\s]+)', meta)
-            if not plugin_id or str(plugin_id.group(1) or "").strip() != __id__ or not version:
+            if (not plugin_id or str(plugin_id.group(1) or "").strip() != __id__ or not version
+                    or str(version.group(1) or "").strip() != release_version):
                 return b"", ""
-            return raw, str(version.group(1) or "").strip()
+            return raw, release_version
         except:
             return b"", ""
 
@@ -1083,10 +1143,9 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 run_on_ui_thread(lambda: self._show_plugin_update_available(remote_version, archive_path))
                 return True
 
-            remote_text = self._fetch_plugin_update_text()
+            remote_text, remote_version = self._fetch_plugin_update_text()
             if (not self._active) and (not force):
                 return False
-            remote_version = _extract_declared_plugin_version(remote_text)
             self._autoupdate_last_seen_version = str(remote_version or "")
             self._save_config()
 
@@ -1100,6 +1159,8 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 return False
             if (not force) and (not self._plugin_autoupdate_enabled()):
                 return False
+            if (not force) and str(self.get_setting("plugin_autoupdate_prompted_version", "") or "") == remote_version:
+                return False
             if (not self._active) and (not force):
                 return False
             if not self._write_updated_plugin_source(remote_text):
@@ -1107,6 +1168,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
 
             if (not self._active) and (not force):
                 return False
+            self._set_setting_value("plugin_autoupdate_prompted_version", remote_version, reload_settings=False)
             run_on_ui_thread(lambda: BulletinHelper.show_info("GreenPass обновлён до %s. Перезапустите приложение." % str(remote_version)))
             return True
         except Exception:

@@ -1,8 +1,8 @@
 __id__ = "GreenPass"
 __name__ = "GreenPass"
 __description__ = "Практически универсальный прокси плагин, поддержка протоколов vless/vmess/hysteria2/etc., встроенные tg-ws-proxy, AmneziaWG и olcrtc, а также полноценнымм проксированием звонков"
-__author__ = "@Altyplugins / Codex"
-__version__ = "2.5.7"
+__author__ = "@Altyplugins"
+__version__ = "2.5.8"
 __icon__ = "bratpass/0"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.5.3"
@@ -273,8 +273,7 @@ SINGBOX_SO_SIZE = int(SINGBOX_BUNDLE.get("so_size", 0) or 0)
 SINGBOX_SO_SHA256 = str(SINGBOX_BUNDLE.get("so_sha256", "") or "")
 SINGBOX_BUNDLE_SIZE = int(SINGBOX_BUNDLE.get("bundle_size", 0) or 0)
 SINGBOX_BUNDLE_SHA256 = str(SINGBOX_BUNDLE.get("bundle_sha256", "") or "")
-GREENPASS_UPDATE_URL = "https://raw.githubusercontent.com/Altuskhins/GreenPass/refs/heads/main/GreenPass.plugin"
-GREENPASS_ELYX_UPDATE_URL = "https://raw.githubusercontent.com/Altuskhins/GreenPass/refs/heads/main/GreenPass.elyx"
+GREENPASS_RELEASES_LATEST_URL = "https://api.github.com/repos/Altuskhins/GreenPass/releases/latest"
 VLESS_IMPORT_CLIPBOARD_MAX = 8192
 VLESS_LOCAL_HOST = "127.0.0.1"
 VLESS_LOCAL_PORT = 10804
