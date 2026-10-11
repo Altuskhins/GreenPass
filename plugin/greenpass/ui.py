@@ -2981,6 +2981,22 @@ class SettingsUiMixin:
 
     def _create_greenpass_extra_subpage(self):
         items = [
+            Header(text="Обновления GreenPass"),
+            Switch(
+                key="plugin_autoupdate_enabled",
+                text="Автообновление GreenPass",
+                default=self._plugin_autoupdate_enabled(),
+                subtext="Проверять новые версии в GitHub Releases",
+                icon="msg_retry",
+                on_change=self._set_plugin_autoupdate_enabled,
+            ),
+            Text(
+                text="Проверить обновления",
+                subtext="Текущая версия: " + str(getattr(self, "version", "") or "?"),
+                icon="msg_download_settings",
+                on_click=lambda *a: self._check_plugin_update_now(),
+            ),
+            Divider(),
             Header(text="Ядро и устройство"),
             Selector(
                 key="vless_engine",
