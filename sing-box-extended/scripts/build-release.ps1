@@ -8,6 +8,7 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $repoRoot = Split-Path -Parent $projectRoot
 $pluginPath = Join-Path $repoRoot "GreenPass.plugin"
+$elyxFoundationPath = Join-Path $repoRoot "greenpass-elyx\plugin\greenpass\foundation.py"
 $buildScript = Join-Path $PSScriptRoot "build-cabi-android.ps1"
 
 $targets = @(
@@ -32,7 +33,7 @@ try {
 $compress = @'
 import lzma, pathlib, sys
 src, dst = map(pathlib.Path, sys.argv[1:3])
-with src.open("rb") as source, lzma.open(dst, "wb", format=lzma.FORMAT_XZ, preset=9 | lzma.PRESET_EXTREME) as target:
+with src.open('rb') as source, lzma.open(dst, 'wb', format=lzma.FORMAT_XZ, preset=9 | lzma.PRESET_EXTREME) as target:
     while chunk := source.read(1024 * 1024):
         target.write(chunk)
 '@
@@ -75,6 +76,17 @@ foreach ($target in $targets) {
 }
 
 [System.IO.File]::WriteAllText($pluginPath, $manifest, [System.Text.UTF8Encoding]::new($false))
+$bundleBlockPattern = '(?ms)^SINGBOX_BUNDLES = \{.*?^\}'
+$bundleBlock = [regex]::Match($manifest, $bundleBlockPattern)
+if (-not $bundleBlock.Success) { throw "Updated SINGBOX_BUNDLES block not found" }
+
+$elyxFoundation = Get-Content -Raw -LiteralPath $elyxFoundationPath
+if ([regex]::Matches($elyxFoundation, $bundleBlockPattern).Count -ne 1) {
+    throw "SINGBOX_BUNDLES block not found in Elyx foundation"
+}
+$elyxFoundation = [regex]::Replace($elyxFoundation, $bundleBlockPattern, $bundleBlock.Value)
+[System.IO.File]::WriteAllText($elyxFoundationPath, $elyxFoundation, [System.Text.UTF8Encoding]::new($false))
+
 python -m py_compile $pluginPath
 if ($LASTEXITCODE -ne 0) { throw "GreenPass.plugin py_compile failed" }
 

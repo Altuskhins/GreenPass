@@ -1,0 +1,16 @@
+zipFormat: eaf
+source: plugin
+buildNameUncompiled: '{name}-{version}'
+buildNameCompiled: '{name}-{version}-3.11'
+ignoreAll:
+- plugin/.elyxbuilder/cache/*
+compilationIgnore:
+- plugin/main.py
+obfuscationConfig:
+  stripDocstrings: true
+  removeLogs: true
+  renameLocals: true
+  encodeStrings: true
+  encodeNumbers: true
+  zlibCompression: false
+  saveMapping: true
