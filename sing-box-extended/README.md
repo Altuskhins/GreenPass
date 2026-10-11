@@ -11,7 +11,7 @@ runtime into ExteraGram.
 
 ```
 sing-box-extended/
-├── go.mod / go.sum        # pins sing-box-extended v1.13.14-extended-2.5.0
+├── go.mod / go.sum        # pins sing-box-extended and Mihomo dependencies
 ├── cbridge/main.go        # C-ABI exports (//export StartCore / StopCore / ...)
 ├── mobilebridge/          # single-session wrapper around box.Box
 ├── mihomobridge/          # sanitized Mihomo local-proxy lifecycle
@@ -45,10 +45,27 @@ small JSON envelope containing either its YAML config or proxy links. The bridge
 forces one authenticated loopback mixed listener and disables imported TUN,
 LAN, controller and server listeners before applying the config.
 
+The embedded Mihomo engine is pinned to `github.com/metacubex/mihomo v1.19.32`.
+Its AmneziaWG transport dependency is Mihomo's compatible `metacubex` fork.
+GreenPass's standalone AmneziaWG mode is provided by the extended sing-box
+build and its `github.com/shtorm-7/wireguard-go v0.0.7-extended-1.6.1`
+integration. The official [AmneziaWG Go v3 line](https://github.com/amnezia-vpn/amneziawg-go)
+has a separate module path and API (latest verified tag: `v3.1.20260828`); it is
+not a drop-in replacement for the sing-box integration. Porting that engine into
+the embedded mode requires changes in the sing-box fork, so this source update
+keeps the latest compatible extended WireGuard fork instead of adding an unused
+module dependency.
+
 ## Build
 
 Requires Go 1.26.4+ and Android NDK r29. Naive's bundled Cronet archive uses
 ARM64 relocations unsupported by the older r27d linker.
+
+`go.mod` expects `../turnlib` (GreenPass `turnlib`) next to this directory, with
+its `olcrtc` submodule at openlibrecommunity/olcrtc `71e72b8` (2026-08-11): the
+newest commit that still has the `mobile` API `turnlib/mobilebridge` uses and the
+`owenlivekit` v2.18.2 dependency set pinned here. It already contains the SEI
+channel, so `turnlib/patches/olcrtc-seichannel.patch` is not needed on it.
 
 ```powershell
 # Env (defaults shown; override via params/env)
