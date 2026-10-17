@@ -3,8 +3,8 @@
 __id__ = "GreenPass"
 __name__ = "GreenPass"
 __description__ = "Практически универсальный прокси плагин, поддержка протоколов vless/vmess/hysteria2/etc., встроенные tg-ws-proxy, AmneziaWG и olcrtc, а также полноценнымм проксированием звонков"
-__author__ = "@Altyplugins / Codex"
-__version__ = "2.5.7"
+__author__ = "@Altyplugins"
+__version__ = "2.6.0"
 __icon__ = "bratpass/0"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.5.3"
@@ -1142,8 +1142,7 @@ SINGBOX_SO_SIZE = int(SINGBOX_BUNDLE.get("so_size", 0) or 0)
 SINGBOX_SO_SHA256 = str(SINGBOX_BUNDLE.get("so_sha256", "") or "")
 SINGBOX_BUNDLE_SIZE = int(SINGBOX_BUNDLE.get("bundle_size", 0) or 0)
 SINGBOX_BUNDLE_SHA256 = str(SINGBOX_BUNDLE.get("bundle_sha256", "") or "")
-GREENPASS_UPDATE_URL = "https://raw.githubusercontent.com/Altuskhins/GreenPass/refs/heads/main/GreenPass.plugin"
-GREENPASS_ELYX_UPDATE_URL = "https://raw.githubusercontent.com/Altuskhins/GreenPass/refs/heads/main/GreenPass.elyx"
+GREENPASS_RELEASES_LATEST_URL = "https://api.github.com/repos/Altuskhins/GreenPass/releases/latest"
 VLESS_IMPORT_CLIPBOARD_MAX = 8192
 VLESS_LOCAL_HOST = "127.0.0.1"
 VLESS_LOCAL_PORT = 10804
@@ -8954,6 +8953,18 @@ class _WebRtcJoinResponseRewriteHook(MethodHook):
 
 __all__ = [name for name in globals() if not name.startswith("__")]
 
+
+class _Ipv6PolicyHook(MethodHook):
+    def __init__(self, plugin):
+        self._plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            if self._plugin._active and not self._plugin._ipv6_enabled():
+                self._plugin._force_ipv4_strategy()
+        except:
+            pass
+
 # --- bundled from greenpass.ui.py ---
 
 
@@ -11932,6 +11943,22 @@ class SettingsUiMixin:
 
     def _create_greenpass_extra_subpage(self):
         items = [
+            Header(text="Обновления GreenPass"),
+            Switch(
+                key="plugin_autoupdate_enabled",
+                text="Автообновление GreenPass",
+                default=self._plugin_autoupdate_enabled(),
+                subtext="Проверять новые версии в GitHub Releases",
+                icon="msg_retry",
+                on_change=self._set_plugin_autoupdate_enabled,
+            ),
+            Text(
+                text="Проверить обновления",
+                subtext="Текущая версия: " + str(getattr(self, "version", "") or "?"),
+                icon="msg_download_settings",
+                on_click=lambda *a: self._check_plugin_update_now(),
+            ),
+            Divider(),
             Header(text="Ядро и устройство"),
             Selector(
                 key="vless_engine",
@@ -11964,6 +11991,14 @@ class SettingsUiMixin:
                 subtext="Направляет запросы плагинов через GreenPass",
                 icon="msg_link",
                 on_change=self._on_plugins_proxy_changed,
+            ),
+            Switch(
+                key="ipv6_enabled",
+                text="IPv6",
+                default=bool(self._ipv6_enabled()),
+                subtext="Выключено — Telegram работает только по IPv4",
+                icon="msg_language",
+                on_change=self._on_ipv6_changed,
             ),
             Switch(
                 key="dont_use_with_vpn",
@@ -14799,6 +14834,11 @@ class TgWsModeMixin:
 
 
 class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcModeMixin, TgWsModeMixin, BasePlugin):
+    def create_settings(self):
+        # Keep the public SDK entry point on the concrete plugin class. Some
+        # client builds only expose settings methods declared directly here.
+        return SettingsUiMixin.create_settings(self)
+
     def __init__(self):
         super().__init__()
         self.name = __name__
@@ -14827,6 +14867,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         self._proxy_button_hooks_installed = False
         self._sync_hooks_installed = False
         self._proxy_killswitch_hook_installed = False
+        self._ipv6_hook_installed = False
         self._awg_activity_hook_installed = False
         self._browser_vless_hook_installed = False
         self._voip_relay_link_hook_installed = False
@@ -15759,23 +15800,77 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 pass
         return False
 
-    def _fetch_plugin_update_text(self):
+    def _fetch_greenpass_release_asset(self, asset_name, max_size=2 * 1024 * 1024):
         try:
-            req = urllib.request.Request(str(GREENPASS_UPDATE_URL), headers={"User-Agent": "GreenPass-Updater"})
-            with urllib.request.urlopen(req, timeout=20, context=ssl.create_default_context()) as resp:
-                raw = resp.read(2 * 1024 * 1024 + 1)
-            if len(raw) > 2 * 1024 * 1024:
-                return ""
-            return raw.decode("utf-8", errors="strict")
+            headers = {
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "GreenPass-Updater",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+            request = urllib.request.Request(str(GREENPASS_RELEASES_LATEST_URL), headers=headers)
+            with urllib.request.urlopen(request, timeout=20, context=ssl.create_default_context()) as response:
+                release_raw = response.read(512 * 1024 + 1)
+            if len(release_raw) > 512 * 1024:
+                return b"", ""
+
+            release = json.loads(release_raw.decode("utf-8", errors="strict"))
+            if not isinstance(release, dict) or release.get("draft") or release.get("prerelease"):
+                return b"", ""
+            tag = str(release.get("tag_name", "") or "").strip()
+            version = tag[1:] if tag[:1].lower() == "v" else tag
+            if not version or not isinstance(release.get("assets"), list):
+                return b"", ""
+
+            asset = None
+            for candidate in release.get("assets", []):
+                if isinstance(candidate, dict) and str(candidate.get("name", "") or "") == str(asset_name):
+                    asset = candidate
+                    break
+            if asset is None:
+                return b"", ""
+
+            expected_size = int(asset.get("size", 0) or 0)
+            download_url = str(asset.get("browser_download_url", "") or "")
+            expected_prefix = "https://github.com/Altuskhins/GreenPass/releases/download/"
+            if expected_size < 1024 or expected_size > int(max_size) or not download_url.startswith(expected_prefix):
+                return b"", ""
+
+            request = urllib.request.Request(download_url, headers={
+                "Accept": "application/octet-stream",
+                "User-Agent": "GreenPass-Updater",
+            })
+            with urllib.request.urlopen(request, timeout=30, context=ssl.create_default_context()) as response:
+                raw = response.read(int(max_size) + 1)
+            if len(raw) != expected_size:
+                return b"", ""
+
+            digest = str(asset.get("digest", "") or "").strip().lower()
+            if digest.startswith("sha256:"):
+                if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), digest[7:]):
+                    return b"", ""
+            return raw, version
         except:
-            return ""
+            return b"", ""
+
+    def _fetch_plugin_update_text(self):
+        raw, release_version = self._fetch_greenpass_release_asset("GreenPass.plugin")
+        if not raw or not release_version:
+            return "", ""
+        try:
+            source = raw.decode("utf-8", errors="strict")
+            source_id = re.search(r'(?m)^__id__\s*=\s*["\']([^"\']+)["\']', source)
+            source_version = _extract_declared_plugin_version(source)
+            if (not source_id or str(source_id.group(1) or "").strip() != __id__
+                    or not source_version or source_version != release_version):
+                return "", ""
+            return source, release_version
+        except:
+            return "", ""
 
     def _fetch_elyx_update_archive(self):
         try:
-            req = urllib.request.Request(str(GREENPASS_ELYX_UPDATE_URL), headers={"User-Agent": "GreenPass-Updater"})
-            with urllib.request.urlopen(req, timeout=20, context=ssl.create_default_context()) as resp:
-                raw = resp.read(2 * 1024 * 1024 + 1)
-            if len(raw) < 1024 or len(raw) > 2 * 1024 * 1024:
+            raw, release_version = self._fetch_greenpass_release_asset("GreenPass.elyx")
+            if not raw or not release_version:
                 return b"", ""
             with zipfile.ZipFile(io.BytesIO(raw), "r") as archive:
                 names = set(archive.namelist())
@@ -15787,9 +15882,10 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 meta = archive.read(info).decode("utf-8", errors="strict")
             plugin_id = re.search(r'(?mi)^id\s*:\s*["\']?([^"\'\s]+)', meta)
             version = re.search(r'(?mi)^version\s*:\s*["\']?([^"\'\s]+)', meta)
-            if not plugin_id or str(plugin_id.group(1) or "").strip() != __id__ or not version:
+            if (not plugin_id or str(plugin_id.group(1) or "").strip() != __id__ or not version
+                    or str(version.group(1) or "").strip() != release_version):
                 return b"", ""
-            return raw, str(version.group(1) or "").strip()
+            return raw, release_version
         except:
             return b"", ""
 
@@ -15861,10 +15957,9 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 run_on_ui_thread(lambda: self._show_plugin_update_available(remote_version, archive_path))
                 return True
 
-            remote_text = self._fetch_plugin_update_text()
+            remote_text, remote_version = self._fetch_plugin_update_text()
             if (not self._active) and (not force):
                 return False
-            remote_version = _extract_declared_plugin_version(remote_text)
             self._autoupdate_last_seen_version = str(remote_version or "")
             self._save_config()
 
@@ -15878,6 +15973,8 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 return False
             if (not force) and (not self._plugin_autoupdate_enabled()):
                 return False
+            if (not force) and str(self.get_setting("plugin_autoupdate_prompted_version", "") or "") == remote_version:
+                return False
             if (not self._active) and (not force):
                 return False
             if not self._write_updated_plugin_source(remote_text):
@@ -15885,6 +15982,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
 
             if (not self._active) and (not force):
                 return False
+            self._set_setting_value("plugin_autoupdate_prompted_version", remote_version, reload_settings=False)
             run_on_ui_thread(lambda: BulletinHelper.show_info("GreenPass обновлён до %s. Перезапустите приложение." % str(remote_version)))
             return True
         except Exception:
@@ -19503,6 +19601,7 @@ Java.perform(function () {
         self._install_proxy_button_hooks()
         self._install_sync_hooks()
         self._install_proxy_killswitch_hook()
+        self._install_ipv6_hook()
         self._install_awg_activity_result_hook()
         self._install_browser_vless_hook()
         self._install_voip_relay_link_hook()
@@ -20060,6 +20159,49 @@ Java.perform(function () {
             method = launch_cls.getClass().getDeclaredMethod("onActivityResult", Integer.TYPE, Integer.TYPE, intent_cls)
             self.hook_method(method, _AwgActivityResultHook(self))
             self._awg_activity_hook_installed = True
+        except Exception:
+            pass
+
+    def _ipv6_enabled(self):
+        try:
+            return bool(self.get_setting("ipv6_enabled", True))
+        except Exception:
+            return True
+
+    def _force_ipv4_strategy(self):
+        for account in range(int(UserConfig.MAX_ACCOUNT_COUNT)):
+            try:
+                ConnectionsManager.native_setIpStrategy(account, 0)
+            except Exception:
+                pass
+
+    def _on_ipv6_changed(self, enabled):
+        try:
+            self.set_setting("ipv6_enabled", bool(enabled), reload_settings=False)
+        except Exception:
+            pass
+        self._install_ipv6_hook()
+        def apply():
+            for account in range(int(UserConfig.MAX_ACCOUNT_COUNT)):
+                try:
+                    ConnectionsManager.getInstance(account).checkConnection()
+                except Exception:
+                    pass
+        run_on_ui_thread(apply)
+        run_on_ui_thread(lambda: BulletinHelper.show_info("IPv6 включён" if enabled else "IPv6 выключен"))
+
+    def _install_ipv6_hook(self):
+        if self._ipv6_hook_installed:
+            return
+        try:
+            cm_class = find_class("org.telegram.tgnet.ConnectionsManager")
+        except Exception:
+            cm_class = None
+        if cm_class is None:
+            return
+        try:
+            self.hook_all_methods(cm_class, "checkConnection", _Ipv6PolicyHook(self))
+            self._ipv6_hook_installed = True
         except Exception:
             pass
 
