@@ -474,3 +474,15 @@ class _WebRtcJoinResponseRewriteHook(MethodHook):
             pass
 
 __all__ = [name for name in globals() if not name.startswith("__")]
+
+
+class _Ipv6PolicyHook(MethodHook):
+    def __init__(self, plugin):
+        self._plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            if self._plugin._active and not self._plugin._ipv6_enabled():
+                self._plugin._force_ipv4_strategy()
+        except:
+            pass

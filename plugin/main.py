@@ -54,6 +54,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         self._proxy_button_hooks_installed = False
         self._sync_hooks_installed = False
         self._proxy_killswitch_hook_installed = False
+        self._ipv6_hook_installed = False
         self._awg_activity_hook_installed = False
         self._browser_vless_hook_installed = False
         self._voip_relay_link_hook_installed = False
@@ -4787,6 +4788,7 @@ Java.perform(function () {
         self._install_proxy_button_hooks()
         self._install_sync_hooks()
         self._install_proxy_killswitch_hook()
+        self._install_ipv6_hook()
         self._install_awg_activity_result_hook()
         self._install_browser_vless_hook()
         self._install_voip_relay_link_hook()
@@ -5344,6 +5346,49 @@ Java.perform(function () {
             method = launch_cls.getClass().getDeclaredMethod("onActivityResult", Integer.TYPE, Integer.TYPE, intent_cls)
             self.hook_method(method, _AwgActivityResultHook(self))
             self._awg_activity_hook_installed = True
+        except Exception:
+            pass
+
+    def _ipv6_enabled(self):
+        try:
+            return bool(self.get_setting("ipv6_enabled", True))
+        except Exception:
+            return True
+
+    def _force_ipv4_strategy(self):
+        for account in range(int(UserConfig.MAX_ACCOUNT_COUNT)):
+            try:
+                ConnectionsManager.native_setIpStrategy(account, 0)
+            except Exception:
+                pass
+
+    def _on_ipv6_changed(self, enabled):
+        try:
+            self.set_setting("ipv6_enabled", bool(enabled), reload_settings=False)
+        except Exception:
+            pass
+        self._install_ipv6_hook()
+        def apply():
+            for account in range(int(UserConfig.MAX_ACCOUNT_COUNT)):
+                try:
+                    ConnectionsManager.getInstance(account).checkConnection()
+                except Exception:
+                    pass
+        run_on_ui_thread(apply)
+        run_on_ui_thread(lambda: BulletinHelper.show_info("IPv6 включён" if enabled else "IPv6 выключен"))
+
+    def _install_ipv6_hook(self):
+        if self._ipv6_hook_installed:
+            return
+        try:
+            cm_class = find_class("org.telegram.tgnet.ConnectionsManager")
+        except Exception:
+            cm_class = None
+        if cm_class is None:
+            return
+        try:
+            self.hook_all_methods(cm_class, "checkConnection", _Ipv6PolicyHook(self))
+            self._ipv6_hook_installed = True
         except Exception:
             pass
 

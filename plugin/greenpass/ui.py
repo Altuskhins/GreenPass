@@ -3031,6 +3031,14 @@ class SettingsUiMixin:
                 on_change=self._on_plugins_proxy_changed,
             ),
             Switch(
+                key="ipv6_enabled",
+                text="IPv6",
+                default=bool(self._ipv6_enabled()),
+                subtext="Выключено — Telegram работает только по IPv4",
+                icon="msg_language",
+                on_change=self._on_ipv6_changed,
+            ),
+            Switch(
                 key="dont_use_with_vpn",
                 text="Не использовать с VPN",
                 default=bool(self.get_setting("dont_use_with_vpn", True)),
