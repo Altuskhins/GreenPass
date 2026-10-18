@@ -1,8 +1,8 @@
 name: GreenPass
 description: "Практически универсальный прокси-плагин для exteraGram"
 id: GreenPass
-version: "2.6.0"
-author: "@Altyplugins"
+version: "2.6.1"
+author: "@Altyplugins / Claude"
 app_version: ">=12.5.1"
 sdk_version: ">=1.4.5.3"
 icon: bratpass/0

@@ -5,6 +5,7 @@ from .greenpass.tgws import *
 from .greenpass.native import *
 from .greenpass.subscriptions import *
 from .greenpass.hooks import *
+from .greenpass.warp import WARP_CONF_NAME, generate_warp_conf
 from .greenpass.ui import SettingsUiMixin
 from .greenpass.modes.singbox import SingBoxModeMixin
 from .greenpass.modes.awg import AwgModeMixin
@@ -85,7 +86,19 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         self._awg_prepare_in_progress = False
         self._awg_conf_name = ""
         self._awg_conf_content = ""
+        self._awg_conf_is_free = False
         self._awg_config_downloading = False
+        self._awg_ipv4_only = False
+        self._awg_health_thread = None
+        self._awg_health_stop = threading.Event()
+        self._awg_health_gen = 0
+        self._awg_health_recovering = False
+        self._awg_health_restarts = 0
+        self._awg_health_hold_until = 0.0
+        self._awg_last_refresh_ts = 0.0
+        self._awg_refresh_failures = 0
+        self._awg_core_fail_until = 0.0
+        self._awg_core_redownload_ts = 0.0
         self._olcrtc_port = 0
         self._olcrtc_running = False
         self._olcrtc_connecting = False
@@ -111,7 +124,20 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         self._vless_connecting = False
         self._vless_last_error = ""
         self._vless_generation = 0
+        # Lock order (outermost first), see also native.py:
+        #   _vless_core_op_lock -> _vless_transition_lock (brief) -> _local_socks_lock
+        #   _vless_core_op_lock -> _GP_NATIVE_LOCK (StartCore/StopCore, process-wide leaf)
+        # The UI thread only ever takes _vless_transition_lock (briefly) and _local_socks_lock;
+        # StartCore/StopCore/dlopen/hashing run on worker threads under _vless_core_op_lock.
         self._vless_transition_lock = threading.RLock()
+        self._vless_core_op_lock = threading.RLock()
+        self._config_save_lock = threading.RLock()
+        self._resume_bg_lock = threading.Lock()
+        self._resume_bg_running = False
+        self._resume_bg_args = None
+        self._native_start_guard = False
+        self._libsingbox_corrupt_key = None
+        self._libsingbox_hash_lock = threading.Lock()
         self._vless_connect_lock = threading.Lock()
         self._vless_connect_worker_active = False
         self._vless_connect_pending = False
@@ -176,8 +202,9 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         self._awg_core = _LazyAWGCore(self._libawg_so_path())
         self._olcrtc_core = _LazyVlessCore(self._libzvonki_so_path())
 
+        self._config_load_failed = False
         self._load_config()
-        if self._config_needs_save:
+        if self._config_needs_save and not self._config_load_failed:
             self._save_config()
         if self._core_restart_resumed:
             self._cleanup_legacy_core_files()
@@ -228,12 +255,24 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         finally:
             self._config_recovering = False
 
-    def _load_config(self):
+    def _load_config(self, strict=False):
+        # Each section is loaded independently so one bad value cannot wipe the
+        # rest. The .bak is rotated here only after a fully successful parse.
+        # With strict=True any failure raises (used to validate imports).
+        failed = []
+        self._config_load_failed = False
         try:
             if os.path.exists(self._config_file):
                 with open(self._config_file, 'r') as f:
                     data = json.load(f)
-                    _saved_schema = int(data.get("config_schema", 0) or 0)
+                if not isinstance(data, dict):
+                    raise ValueError("config is not an object")
+
+                try:
+                    try:
+                        _saved_schema = int(data.get("config_schema", 0) or 0)
+                    except Exception:
+                        _saved_schema = 0
                     _saved_version = str(data.get("last_loaded_version", "") or "")
                     _cur_major = str(__version__).split(".")[0]
                     _saved_major = _saved_version.split(".")[0] if _saved_version else ""
@@ -277,6 +316,10 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                         self._config_needs_save = True
                     self._autoupdate_last_check_ts = int(data.get("autoupdate_last_check_ts", 0) or 0)
                     self._autoupdate_last_seen_version = str(data.get("autoupdate_last_seen_version", "") or "")
+                except Exception as _e:
+                    failed.append("core: %s" % _e)
+
+                try:
                     self._proxy_suspended_by_vpn = False
                     self._proxy_suspended_by_wifi = False
                     self._excluded_wifi_ssids = self._sanitize_excluded_wifi_ssids(data.get("excluded_wifi_ssids", []))
@@ -289,13 +332,32 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                     self._wifi_default_mode = self._normalize_proxy_mode(
                         data.get("wifi_default_mode", self._connection_mode), self._connection_mode
                     )
+                except Exception as _e:
+                    failed.append("wifi: %s" % _e)
+                    self._excluded_wifi_ssids = []
+                    self._wifi_mode_rules = {}
+                    self._wifi_default_mode = self._connection_mode
+
+                try:
                     awg_data = data.get("awg_data", None)
                     if isinstance(awg_data, dict):
                         self._awg_conf_name = str(awg_data.get("conf_name", "") or "")
                         self._awg_conf_content = str(awg_data.get("conf_content", "") or "")
+                        if "conf_is_free" in awg_data:
+                            self._awg_conf_is_free = bool(awg_data.get("conf_is_free"))
+                        else:
+                            self._awg_conf_is_free = _infer_awg_conf_is_free(self._awg_conf_name, self._awg_conf_content)
                     else:
                         self._awg_conf_name = ""
                         self._awg_conf_content = ""
+                        self._awg_conf_is_free = False
+                except Exception as _e:
+                    failed.append("awg: %s" % _e)
+                    self._awg_conf_name = ""
+                    self._awg_conf_content = ""
+                    self._awg_conf_is_free = False
+
+                try:
                     vless_data = data.get("vless_data", None)
                     if isinstance(vless_data, dict):
                         manual = vless_data.get("manual", [])
@@ -308,7 +370,11 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                         }
                     else:
                         self._vless_data = {"manual": [], "subs": [], "active_uri": ""}
+                except Exception as _e:
+                    failed.append("vless: %s" % _e)
+                    self._vless_data = {"manual": [], "subs": [], "active_uri": ""}
 
+                try:
                     qwdtt_data = data.get("qwdtt_data", None)
                     if isinstance(qwdtt_data, dict):
                         self._qwdtt_data = {
@@ -325,11 +391,15 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                     legacy_qwdtt_nodes = [node for node in legacy_qwdtt_nodes if node]
                     if legacy_qwdtt_nodes:
                         known = {str(node.get("uri", "") or "") for node in legacy_qwdtt_nodes}
-                        self._vless_data["manual"] = (legacy_qwdtt_nodes + [node for node in list(self._vless_data.get("manual", []) or []) if str(node.get("uri", "") or "") not in known])[:64]
+                        self._vless_data["manual"] = (legacy_qwdtt_nodes + [node for node in list(self._vless_data.get("manual", []) or []) if isinstance(node, dict) and str(node.get("uri", "") or "") not in known])[:64]
                         if self._connection_mode == QWDTT_KIND and not self._vless_data.get("active_uri"):
                             self._vless_data["active_uri"] = str(legacy_qwdtt_nodes[0].get("uri", "") or "")
                         self._qwdtt_data = {"profiles": [], "subs": [], "active_id": ""}
                         self._config_needs_save = True
+                except Exception as _e:
+                    failed.append("qwdtt: %s" % _e)
+                    self._qwdtt_data = {"profiles": [], "subs": [], "active_id": ""}
+                try:
                     if self._connection_mode == QWDTT_KIND:
                         self._connection_mode = VLESS_KIND
                         self._config_needs_save = True
@@ -338,7 +408,10 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                     self._connection_mode = self._normalize_proxy_mode(
                         self._wifi_default_mode, self._connection_mode
                     )
+                except Exception as _e:
+                    failed.append("mode: %s" % _e)
 
+                try:
                     olcrtc_data = data.get("olcrtc_data", None)
                     if isinstance(olcrtc_data, dict):
                         profiles = olcrtc_data.get("profiles", [])
@@ -353,12 +426,34 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                     active_olcrtc_profile = self._active_olcrtc_profile()
                     if active_olcrtc_profile:
                         self._set_olcrtc_legacy_settings_from_profile(active_olcrtc_profile)
+                except Exception as _e:
+                    failed.append("olcrtc: %s" % _e)
+                    self._olcrtc_profiles = []
+                    self._olcrtc_active_profile_id = ""
 
-                try:
-                    self._atomic_write_json(self._config_file + ".bak", data)
-                except:
-                    pass
+                if failed:
+                    self._config_load_failed = True
+                    if strict:
+                        raise Exception("; ".join(failed))
+                    try:
+                        with open(self._config_file, 'rb') as src:
+                            raw_copy = src.read()
+                        with open(self._config_file + ".failed", 'wb') as dst:
+                            dst.write(raw_copy)
+                    except:
+                        pass
+                    try:
+                        self.log("GreenPass config sections reset: %s" % "; ".join(failed))
+                    except:
+                        pass
+                else:
+                    try:
+                        self._atomic_write_json(self._config_file + ".bak", data)
+                    except:
+                        pass
         except Exception:
+            if strict:
+                raise
             self._recover_config_from_backup()
         try:
             prefs = ApplicationLoader.applicationContext.getSharedPreferences("greenpass_prefs", 0)
@@ -379,7 +474,25 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
 
     _GREENPASS_CONFIG_SCHEMA = 3
 
+    @staticmethod
+    def _config_snapshot(value):
+        # Ping/subscription workers mutate these dicts while a save is running:
+        # take a private copy, retrying if the copy itself races a mutation.
+        last = None
+        for _ in range(4):
+            try:
+                return json.loads(json.dumps(value))
+            except RuntimeError as exc:
+                last = exc
+                time.sleep(0.01)
+        raise last if last is not None else RuntimeError("config snapshot failed")
+
     def _save_config(self):
+        # One save at a time: the snapshot taken last is also the file written last.
+        with self._config_save_lock:
+            self._save_config_locked()
+
+    def _save_config_locked(self):
         try:
             data = {
                 "server": self._current_server,
@@ -403,20 +516,20 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 "awg_data": {
                     "conf_name": str(self._awg_conf_name or ""),
                     "conf_content": str(self._awg_conf_content or ""),
+                    "conf_is_free": bool(self._awg_conf_is_free),
                 },
-                "vless_data": self._vless_data,
+                "vless_data": self._config_snapshot(self._vless_data),
                 "olcrtc_data": {
-                    "profiles": self._sanitize_olcrtc_profiles(self._olcrtc_profiles),
+                    "profiles": self._config_snapshot(self._sanitize_olcrtc_profiles(self._olcrtc_profiles)),
                     "active_profile_id": str(self._olcrtc_active_profile_id or ""),
                 },
             }
             self._atomic_write_json(self._config_file, data)
+        except Exception as _e:
             try:
-                self._atomic_write_json(self._config_file + ".bak", data)
+                self.log("GreenPass save config failed: %s" % _e)
             except:
                 pass
-        except Exception:
-            pass
 
     def _greenpass_settings_keys(self):
         return (
@@ -498,7 +611,58 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 return "[]"
         return str(value or "")
 
+    def _migrate_selector_value_settings(self):
+        # Older builds reused the value keys as Selector index keys, so they may hold
+        # a list index (0..3 / 1..4) instead of the real value. Convert and clamp.
+        sentinel = object()
+        try:
+            raw = self.get_setting("vless_browser_page_size", sentinel)
+            if raw is not sentinel and raw is not None:
+                try:
+                    value = int(raw)
+                except:
+                    value = 20
+                sizes = (10, 20, 40, 60)
+                if 0 <= value < len(sizes):
+                    value = sizes[value]
+                value = max(5, min(100, value))
+                if value != raw:
+                    self._set_setting_value("vless_browser_page_size", value, reload_settings=False)
+        except:
+            pass
+        try:
+            raw = self.get_setting("vless_auto_check_minutes", sentinel)
+            if raw is not sentinel and raw is not None:
+                try:
+                    value = int(raw)
+                except:
+                    value = 0
+                minutes = (0, 5, 15, 30, 60)
+                if value not in minutes and 0 <= value < len(minutes):
+                    value = minutes[value]
+                value = max(0, min(60, value))
+                if value != raw:
+                    self._set_setting_value("vless_auto_check_minutes", value, reload_settings=False)
+        except:
+            pass
+        try:
+            # Transport is persisted as a full-list index; keep it inside the list.
+            raw = self.get_setting("olcrtc_transport", sentinel)
+            if raw is not sentinel and raw is not None:
+                try:
+                    value = int(raw)
+                except:
+                    value = 0
+                if value < 0 or value >= len(OLCRTC_TRANSPORT_ITEMS):
+                    self._set_setting_value("olcrtc_transport", 0, reload_settings=False)
+        except:
+            pass
+
     def _repair_greenpass_settings_nulls(self):
+        try:
+            self._migrate_selector_value_settings()
+        except:
+            pass
         sentinel = object()
         for key in self._greenpass_repair_settings_keys():
             try:
@@ -559,6 +723,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
             "awg_data": {
                 "conf_name": str(self._awg_conf_name or ""),
                 "conf_content": str(self._awg_conf_content or ""),
+                "conf_is_free": bool(self._awg_conf_is_free),
             },
             "vless_data": self._vless_data,
             "olcrtc_data": {
@@ -567,13 +732,34 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
             },
         }
 
+    _GREENPASS_PROCESS_LOCAL_KEYS = (
+        "core_restart_required_pid",
+        "core_restart_reason",
+        "core_restart_resume_mode",
+        "core_restart_resume_enabled",
+        "autoupdate_last_check_ts",
+        "autoupdate_last_seen_version",
+        "last_loaded_version",
+        "config_schema",
+        "vless_socks_password",
+    )
+
+    def _greenpass_strip_process_local_keys(self, config):
+        try:
+            cleaned = dict(config)
+        except Exception:
+            return config
+        for key in self._GREENPASS_PROCESS_LOCAL_KEYS:
+            cleaned.pop(key, None)
+        return cleaned
+
     def _greenpass_export_payload(self):
         return {
             "format": GREENPASS_EXPORT_FORMAT,
             "plugin_id": str(__id__),
             "plugin_version": str(__version__),
             "exported_at": int(time.time()),
-            "config": self._greenpass_current_config_snapshot(),
+            "config": self._greenpass_strip_process_local_keys(self._greenpass_current_config_snapshot()),
             "settings": self._greenpass_export_settings(),
         }
 
@@ -717,12 +903,42 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         settings = payload.get("settings", {}) or {}
         if not isinstance(config, dict):
             raise Exception("missing config")
+        config = self._greenpass_strip_process_local_keys(config)
+        previous_bytes = None
+        try:
+            if os.path.exists(self._config_file):
+                with open(self._config_file, "rb") as pf:
+                    previous_bytes = pf.read()
+        except:
+            previous_bytes = None
+        # Keep the current values in memory so a rejected import changes nothing.
+        keep_socks_password = str(getattr(self, "_vless_socks_password", "") or "")
         self._atomic_write_json(self._config_file, config)
         try:
-            self._atomic_write_json(self._config_file + ".bak", config)
-        except:
-            pass
-        self._load_config()
+            self._load_config(strict=True)
+        except Exception as import_error:
+            try:
+                if previous_bytes is not None:
+                    tmp_restore = self._config_file + ".restore.tmp"
+                    with open(tmp_restore, "wb") as rf:
+                        rf.write(previous_bytes)
+                        try:
+                            rf.flush()
+                            os.fsync(rf.fileno())
+                        except:
+                            pass
+                    os.replace(tmp_restore, self._config_file)
+                else:
+                    os.remove(self._config_file)
+            except:
+                pass
+            try:
+                self._load_config()
+                if keep_socks_password and re.fullmatch(r"[0-9a-f]{32}", keep_socks_password):
+                    self._vless_socks_password = keep_socks_password
+            except:
+                pass
+            raise Exception("config rejected: %s" % import_error)
         for key in self._greenpass_settings_keys():
             if key in settings:
                 try:
@@ -962,22 +1178,83 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
             return ""
         return path
 
+    @staticmethod
+    def _declared_min_version(source, name):
+        try:
+            match = re.search(r"(?m)^%s\s*=\s*[\"']\s*>=\s*([0-9][0-9.]*)" % re.escape(name), str(source or ""))
+            if not match:
+                return None
+            return tuple(int(part) for part in match.group(1).split(".") if part != "")
+        except Exception:
+            return None
+
+    def _plugin_update_is_compatible(self, source):
+        # Refuse an update that demands a newer client/SDK than this build declares:
+        # such a file would fail to load and nothing could repair it afterwards.
+        for name, current in (("__app_version__", __app_version__), ("__sdk_version__", __sdk_version__)):
+            new_req = self._declared_min_version(source, name)
+            if new_req is None:
+                return False
+            current_req = self._declared_min_version('%s = "%s"' % (name, current), name)
+            if current_req is not None and new_req > current_req:
+                return False
+        return True
+
+    def _plugin_write_lock(self):
+        with _GP_GO_CORE_LOCK:
+            lock = getattr(_GP_PROCESS_STATE, "plugin_write_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                _GP_PROCESS_STATE.plugin_write_lock = lock
+            return lock
+
     def _write_updated_plugin_source(self, plugin_text):
         path = self._plugin_runtime_path()
         if not path:
             return False
         source = str(plugin_text or "")
-        if len(source.encode("utf-8", errors="ignore")) < 1024 or len(source.encode("utf-8", errors="ignore")) > 2 * 1024 * 1024:
+        try:
+            data = source.encode("utf-8")
+        except Exception:
+            return False
+        if len(data) < 1024 or len(data) > 2 * 1024 * 1024:
             return False
         try:
             compile(source, path, "exec")
         except:
             return False
-        temp_path = path + ".tmp"
+        if not self._plugin_update_is_compatible(source):
+            return False
+        # Process-wide: a reloaded instance or "check now" must not write concurrently.
+        lock = self._plugin_write_lock()
+        if not lock.acquire(False):
+            return False
+        temp_path = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
         try:
-            with open(temp_path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(source)
+            with open(temp_path, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                # Keep the previous working file so a bad update can be rolled back by hand.
+                if os.path.isfile(path):
+                    with open(path, "rb") as old_f:
+                        old_bytes = old_f.read()
+                    with open(path + ".bak", "wb") as bak_f:
+                        bak_f.write(old_bytes)
+                        bak_f.flush()
+                        os.fsync(bak_f.fileno())
+            except Exception:
+                pass
             os.replace(temp_path, path)
+            try:
+                fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except Exception:
+                pass
             return True
         except:
             try:
@@ -985,9 +1262,11 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                     os.remove(temp_path)
             except:
                 pass
+        finally:
+            lock.release()
         return False
 
-    def _fetch_greenpass_release_asset(self, asset_name, max_size=2 * 1024 * 1024):
+    def _fetch_greenpass_release_asset(self, asset_name, max_size=2 * 1024 * 1024, newer_than=None, skip_version=None):
         try:
             headers = {
                 "Accept": "application/vnd.github+json",
@@ -1007,6 +1286,10 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
             version = tag[1:] if tag[:1].lower() == "v" else tag
             if not version or not isinstance(release.get("assets"), list):
                 return b"", ""
+            if newer_than and not _is_version_newer(version, newer_than):
+                return b"", version
+            if skip_version and version == str(skip_version):
+                return b"", version
 
             asset = None
             for candidate in release.get("assets", []):
@@ -1039,8 +1322,10 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         except:
             return b"", ""
 
-    def _fetch_plugin_update_text(self):
-        raw, release_version = self._fetch_greenpass_release_asset("GreenPass.plugin")
+    def _fetch_plugin_update_text(self, newer_than=None, skip_version=None):
+        raw, release_version = self._fetch_greenpass_release_asset("GreenPass.plugin", newer_than=newer_than, skip_version=skip_version)
+        if not raw and release_version:
+            return "", release_version
         if not raw or not release_version:
             return "", ""
         try:
@@ -1054,9 +1339,11 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         except:
             return "", ""
 
-    def _fetch_elyx_update_archive(self):
+    def _fetch_elyx_update_archive(self, newer_than=None, skip_version=None):
         try:
-            raw, release_version = self._fetch_greenpass_release_asset("GreenPass.elyx")
+            raw, release_version = self._fetch_greenpass_release_asset("GreenPass.elyx", newer_than=newer_than, skip_version=skip_version)
+            if not raw and release_version:
+                return b"", release_version
             if not raw or not release_version:
                 return b"", ""
             with zipfile.ZipFile(io.BytesIO(raw), "r") as archive:
@@ -1115,16 +1402,24 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         if (not force) and (now_ts - int(self._autoupdate_last_check_ts or 0) < int(PLUGIN_AUTOUPDATE_CHECK_INTERVAL_SEC)):
             return False
 
+        if not force:
+            try:
+                if int(self.get_setting("plugin_autoupdate_snooze_until", 0) or 0) > now_ts:
+                    return False
+            except:
+                pass
+
         self._autoupdate_in_progress = True
         try:
             self._autoupdate_last_check_ts = now_ts
             self._save_config()
 
+            skip_version = None if force else str(self.get_setting("plugin_autoupdate_prompted_version", "") or "")
             if _is_elyx_runtime():
-                archive_bytes, remote_version = self._fetch_elyx_update_archive()
+                archive_bytes, remote_version = self._fetch_elyx_update_archive(newer_than=__version__, skip_version=skip_version)
                 self._autoupdate_last_seen_version = str(remote_version or "")
                 self._save_config()
-                if not archive_bytes or not remote_version:
+                if not remote_version:
                     if force:
                         run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось проверить обновления GreenPass"))
                     return False
@@ -1136,6 +1431,10 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                     return False
                 if (not force) and str(self.get_setting("plugin_autoupdate_prompted_version", "") or "") == remote_version:
                     return False
+                if not archive_bytes:
+                    if force:
+                        run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось проверить обновления GreenPass"))
+                    return False
                 archive_path = self._save_elyx_update_archive(archive_bytes)
                 if not archive_path:
                     if force:
@@ -1144,13 +1443,13 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 run_on_ui_thread(lambda: self._show_plugin_update_available(remote_version, archive_path))
                 return True
 
-            remote_text, remote_version = self._fetch_plugin_update_text()
+            remote_text, remote_version = self._fetch_plugin_update_text(newer_than=__version__, skip_version=skip_version)
             if (not self._active) and (not force):
                 return False
             self._autoupdate_last_seen_version = str(remote_version or "")
             self._save_config()
 
-            if not remote_text or not remote_version:
+            if not remote_version:
                 if force:
                     run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось проверить обновления GreenPass"))
                 return False
@@ -1161,6 +1460,10 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
             if (not force) and (not self._plugin_autoupdate_enabled()):
                 return False
             if (not force) and str(self.get_setting("plugin_autoupdate_prompted_version", "") or "") == remote_version:
+                return False
+            if not remote_text:
+                if force:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось проверить обновления GreenPass"))
                 return False
             if (not self._active) and (not force):
                 return False
@@ -1187,7 +1490,9 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
     def _update_outdated_core_in_background(self, force=False):
         if (not force) and (not self._core_autoupdate_enabled()):
             return False
-        initial_status = self._libsingbox_addon_status()
+        # UI callers get the quick answer ("checking" starts a background validation that
+        # re-enters here when it finishes); worker threads may hash.
+        initial_status = self._libsingbox_addon_status(quick=_gp_is_ui_thread())
         if initial_status not in ("missing", "outdated") or self._vless_prepare_in_progress:
             return False
         self._set_core_download_in_progress(True)
@@ -1201,7 +1506,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                     else:
                         message = "Ядро GreenPass установлено" if installed else "Ядро GreenPass обновлено"
                     run_on_ui_thread(lambda: BulletinHelper.show_success(message))
-                    if not self._core_restart_required() and self._is_plugin_proxy_enabled():
+                    if not self._core_restart_required() and self._is_plugin_proxy_enabled() and not self._auto_start_suppressed():
                         run_on_ui_thread(lambda: self._on_use_proxy_changed(True))
             finally:
                 self._set_core_download_in_progress(False)
@@ -1223,10 +1528,51 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
             return False
 
     def _greenpass_core_loaded(self):
+        # The Go runtime is per PROCESS: a previous plugin instance may have loaded it.
+        if _gp_core_loaded_in_process():
+            return True
         return any(
             getattr(getattr(self, name, None), "_real", None) is not None
             for name in ("_vless_core", "_awg_core", "_olcrtc_core")
         )
+
+    def _auto_start_suppressed(self):
+        # Set for this load when the previous process died inside StartCore.
+        return bool(getattr(self, "_native_start_guard", False))
+
+    def _native_start_guard_release(self):
+        # Any user-initiated start lifts the crash-loop guard.
+        if getattr(self, "_native_start_guard", False):
+            self._native_start_guard = False
+
+    def _native_start_crash_check(self):
+        """Crash-loop guard: a leftover 'StartCore in progress' marker means the previous
+        process died inside the native start (a Go panic aborts the whole app). Skip the
+        automatic start once, tell the user, and never block manual starts."""
+        try:
+            marker = _gp_consume_crashed_start_marker(self._libsingbox_so_path())
+        except Exception:
+            marker = None
+        if not marker:
+            return False
+        self._native_start_guard = True
+        message = "Ядро аварийно завершилось при запуске — автозапуск пропущен. Запустите вручную или выберите другой узел"
+        try:
+            kind = str(marker.get("kind", "") or "")
+            if kind == "vless":
+                self._vless_last_error = message
+            elif kind == "awg":
+                self._awg_last_error = message
+            elif kind == "olcrtc":
+                self._olcrtc_last_error = message
+        except Exception:
+            pass
+        try:
+            self.log("GreenPass: previous native start did not finish (%s); auto-start skipped" % marker.get("kind", ""))
+        except Exception:
+            pass
+        run_on_ui_thread(lambda: BulletinHelper.show_error(message))
+        return True
 
     def _mark_core_restart_required(self):
         self._core_restart_resume_mode = str(self._get_connection_mode() or AWG_KIND)
@@ -1355,7 +1701,8 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
             if total != int(SINGBOX_SO_SIZE) or hasher.hexdigest() != SINGBOX_SO_SHA256:
                 raise ValueError("singbox checksum mismatch")
             os.replace(tmp_path, target_path)
-            self._libsingbox_validation_cache = None
+            # The hash was verified while unpacking: remember it (no second 126 MB pass).
+            self._libsingbox_prime_validity(target_path)
             return True
         except:
             try:
@@ -1381,6 +1728,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 on_progress(1.0, "Готово")
             return True
         core_was_loaded = self._greenpass_core_loaded()
+        prior_blocked = bool(getattr(_GP_PROCESS_STATE, "go_core_blocked", False))
         try:
             if not os.path.exists(self._vless_dir):
                 os.makedirs(self._vless_dir)
@@ -1388,6 +1736,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
             pass
 
         target = self._libsingbox_so_path()
+        loaded_id = getattr(_GP_PROCESS_STATE, "go_core_id", None)
         xz_tmp = str(target) + ".xz.tmp"
         try:
             if allow_network:
@@ -1402,11 +1751,26 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
             digest, size = self._sha256_file(xz_tmp, max_bytes=int(SINGBOX_BUNDLE_SIZE))
             if size != int(SINGBOX_BUNDLE_SIZE) or digest != SINGBOX_BUNDLE_SHA256:
                 return False
+            if core_was_loaded:
+                # BEFORE the file is replaced: from this moment nothing may dlopen the new
+                # inode next to the Go runtime that is already running in this process.
+                _gp_set_go_core_blocked(True)
             installed = self._unpack_libsingbox_bundle(
                 xz_tmp,
                 target,
                 on_progress=(lambda value: on_progress(0.75 + 0.24 * value, "Распаковка")) if on_progress else None,
             ) and self._libsingbox_addon_status() == "current"
+            if core_was_loaded and not installed:
+                replaced = False
+                try:
+                    replaced = bool(loaded_id is not None and _gp_file_id(target) != tuple(loaded_id))
+                except Exception:
+                    replaced = False
+                if replaced:
+                    # The file changed although the check failed: still only a restart can switch.
+                    self._mark_core_restart_required()
+                else:
+                    _gp_set_go_core_blocked(prior_blocked)
             if installed:
                 if on_progress:
                     on_progress(1.0, "Готово")
@@ -2579,7 +2943,12 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
 
         plugin = self
         originals = self._plugin_proxy_originals
-        originals["socket.create_connection"] = socket.create_connection
+        # Keep the true originals process-wide so a reload never wraps a stale patch.
+        true_create = getattr(_GP_PROCESS_STATE, "orig_socket_create_connection", None)
+        if true_create is None:
+            true_create = socket.create_connection
+            _GP_PROCESS_STATE.orig_socket_create_connection = true_create
+        originals["socket.create_connection"] = true_create
 
         def patched_socket_create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, *args, **kwargs):
             ep = plugin._plugin_proxy_endpoint()
@@ -2598,7 +2967,11 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
 
         try:
             import urllib3.util.connection as urllib3_connection
-            originals["urllib3.util.connection.create_connection"] = urllib3_connection.create_connection
+            true_u3 = getattr(_GP_PROCESS_STATE, "orig_urllib3_create_connection", None)
+            if true_u3 is None:
+                true_u3 = urllib3_connection.create_connection
+                _GP_PROCESS_STATE.orig_urllib3_create_connection = true_u3
+            originals["urllib3.util.connection.create_connection"] = true_u3
 
             def patched_urllib3_create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, socket_options=None):
                 ep = plugin._plugin_proxy_endpoint()
@@ -2627,9 +3000,25 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         return True
 
     def _remove_python_http_proxy_patch(self):
-        if not self._plugin_proxy_python_patch_installed:
-            return
         originals = self._plugin_proxy_originals
+        if not self._plugin_proxy_python_patch_installed:
+            # A previous instance may have left its patch behind; undo it too.
+            try:
+                if getattr(socket.create_connection, "__name__", "") == "patched_socket_create_connection":
+                    stale = getattr(_GP_PROCESS_STATE, "orig_socket_create_connection", None)
+                    if stale is not None:
+                        socket.create_connection = stale
+            except:
+                pass
+            try:
+                import urllib3.util.connection as urllib3_connection
+                if getattr(urllib3_connection.create_connection, "__name__", "") == "patched_urllib3_create_connection":
+                    stale = getattr(_GP_PROCESS_STATE, "orig_urllib3_create_connection", None)
+                    if stale is not None:
+                        urllib3_connection.create_connection = stale
+            except:
+                pass
+            return
         try:
             original = originals.get("socket.create_connection")
             if original is not None:
@@ -2729,6 +3118,11 @@ Java.perform(function () {
         self._plugin_proxy_frida_endpoint_key = ""
 
     def _sync_plugin_proxy_bridge(self):
+        if not self._active:
+            # Unloading: never re-install the socket patch or the autoload Frida script.
+            self._remove_python_http_proxy_patch()
+            self._deactivate_frida_plugin_proxy_hook()
+            return
         try:
             self._install_plugin_proxy_api()
         except:
@@ -2741,12 +3135,8 @@ Java.perform(function () {
             self._remove_python_http_proxy_patch()
             self._deactivate_frida_plugin_proxy_hook()
     def _is_plugin_proxy_enabled(self):
-        try:
-            raw = self.get_setting("use_proxy", None)
-            if raw is not None:
-                return bool(raw)
-        except:
-            pass
+        # The persisted config flag is the single source of truth; the SDK
+        # "use_proxy" setting is only a UI mirror written from it on load.
         try:
             return bool(self._desired_use_proxy)
         except:
@@ -3346,6 +3736,19 @@ Java.perform(function () {
         return host or "Серверы"
 
     def _apply_local_socks_proxy(self, port, enable, owner=None, expected_port=None, username="", password="", secret=""):
+        # SharedConfig.proxyList is a plain ArrayList that Telegram iterates on the UI
+        # thread: mutating it from a worker can throw ConcurrentModificationException there.
+        # Hop to the UI thread (3 s at most) and run the whole body there. No plugin lock
+        # is held while waiting, so a UI caller can never deadlock against this wait.
+        if not _gp_is_ui_thread():
+            completed, result = _gp_run_on_ui_wait(
+                lambda: self._apply_local_socks_proxy_body(port, enable, owner, expected_port, username, password, secret),
+                timeout=3.0,
+            )
+            return bool(result) if completed else False
+        return self._apply_local_socks_proxy_body(port, enable, owner, expected_port, username, password, secret)
+
+    def _apply_local_socks_proxy_body(self, port, enable, owner=None, expected_port=None, username="", password="", secret=""):
         try:
             target_port = int(port or 0)
         except:
@@ -3848,6 +4251,34 @@ Java.perform(function () {
             return False
         return self._apply_local_socks_proxy(0, False, owner=target_owner, expected_port=expected_port)
 
+    def _clear_stale_greenpass_proxy(self):
+        """Disable Telegram's active proxy if it is a GreenPass loopback entry,
+        even one applied by a previous process (Telegram persists it)."""
+        try:
+            proxy = SharedConfig.currentProxy
+        except:
+            proxy = None
+        if proxy is None:
+            return False
+        try:
+            values = self._local_proxy_values(proxy)
+            address = str(values.get("address", "") or "")
+            if address not in (VLESS_LOCAL_HOST, "localhost", "::1"):
+                return False
+            port = int(values.get("port", 0) or 0)
+            username = str(values.get("username", "") or "")
+            secret = str(values.get("secret", "") or "").strip().lower()
+            known_ports = {int(VLESS_LOCAL_PORT), int(AWG_LOCAL_PORT), int(OLCRTC_LOCAL_PORT), int(TGWS_LOCAL_PORT)}
+            ours = port in known_ports or username == "greenpass"
+            if not ours and secret:
+                ours = secret == str(_tgws_proxy_secret_for_telegram()).lower()
+            if not ours:
+                return False
+            _set_tg_proxy_enabled(False)
+            return True
+        except:
+            return False
+
     def _download_libvless_with_progress(self):
         return self._install_libsingbox_bundle(allow_network=True)
 
@@ -3892,6 +4323,8 @@ Java.perform(function () {
         self._vless_retry_after = time.monotonic() + _vless_retry_delay(self._vless_retry_failures)
 
     def _auto_reconnect_vless(self):
+        if self._auto_start_suppressed():
+            return False
         if bool(self._vless_backgrounded):
             return False
         if time.monotonic() < float(self._vless_retry_after or 0.0):
@@ -3940,6 +4373,8 @@ Java.perform(function () {
             time.sleep(0.25)
         if not self._should_run_vless() or str(self._get_active_vless_uri() or "") != expected_uri:
             return False
+        if self._auto_start_suppressed():
+            return False
         if verify_tunnel:
             self._reset_vless_retry()
         elif time.monotonic() < float(self._vless_retry_after or 0.0):
@@ -3981,20 +4416,22 @@ Java.perform(function () {
             if int(self._vless_generation or 0) != int(generation) or int(self._vless_port or 0) != int(port or 0):
                 return False
             self._vless_generation = int(self._vless_generation or 0) + 1
+            new_generation = int(self._vless_generation)
             self._vless_running = False
             self._vless_port = 0
             self._vless_socks_username = ""
             self._vless_active_config_key = ""
             owner = str(getattr(self, "_vless_local_owner", VLESS_KIND) or VLESS_KIND)
             self._vless_local_owner = VLESS_KIND
-            try:
-                self._vless_core.stop()
-            except:
-                pass
-            if int(port or 0) > 0:
-                self._clear_local_socks_proxy_if_port(port, owner=owner)
             self._delay_vless_retry()
-            return True
+        # Telegram's proxy first, then the core; neither under the transition lock.
+        if int(port or 0) > 0:
+            try:
+                self._clear_local_socks_proxy_if_port(port, owner=owner)
+            except Exception:
+                pass
+        self._stop_vless_core_for_generation(new_generation)
+        return True
 
 
     def _save_vless_manual_node(self, node):
@@ -4026,9 +4463,13 @@ Java.perform(function () {
         label = str(protocol_label or "Прокси")
         if not self._has_libvless_addon():
             return "Нужно ядро прокси"
+        if _gp_is_ui_thread() and getattr(self._vless_core, "_real", None) is None:
+            # Never dlopen the Go library on the UI thread; the connect path validates
+            # the same config again on its worker thread.
+            return ""
         result = self._vless_core.validate(config_json)
         if result is None:
-            if self._libsingbox_addon_status() == "outdated" and self._effective_vless_engine() == VLESS_ENGINE_SINGBOX:
+            if self._libsingbox_addon_status(quick=True) in ("outdated", "checking") and self._effective_vless_engine() == VLESS_ENGINE_SINGBOX:
                 return ""
             return "Обновите ядро: проверка конфигурации недоступна"
         error = str(result or "").strip()
@@ -4087,7 +4528,7 @@ Java.perform(function () {
         except:
             return False
 
-    def _stop_olcrtc_core_async(self):
+    def _stop_olcrtc_core_async(self, generation=None):
         def _worker():
             try:
                 with self._olcrtc_stop_lock:
@@ -4095,6 +4536,9 @@ Java.perform(function () {
                         return
                     self._olcrtc_stop_in_progress = True
                 try:
+                    # A connect that started after this disconnect owns the core now.
+                    if generation is not None and not self._same_olcrtc_generation(generation):
+                        return
                     self._olcrtc_core.stop()
                 except Exception:
                     pass
@@ -4118,6 +4562,7 @@ Java.perform(function () {
 
 
     def _restart_olcrtc_from_settings(self):
+        self._native_start_guard_release()
         self._set_connection_mode(OLCRTC_KIND)
         if not self._is_olcrtc_config_ready():
             self._set_olcrtc_last_error(self._olcrtc_config_error(), event="restart_config_error")
@@ -4216,6 +4661,9 @@ Java.perform(function () {
             content = "\n".join(lines) + "\n"
             self._awg_conf_name = file_name
             self._awg_conf_content = content
+            self._awg_conf_is_free = False
+            self._awg_health_restarts = 0
+            self._awg_health_hold_until = 0.0
             self._save_config()
             run_on_ui_thread(lambda: BulletinHelper.show_success("AWG конфиг загружен"))
             if self._is_awg_mode_selected():
@@ -4226,61 +4674,94 @@ Java.perform(function () {
             err_text = str(exc)
             run_on_ui_thread(lambda err_text=err_text: BulletinHelper.show_error("Ошибка чтения AWG: %s" % err_text))
 
-    def _download_free_awg_config(self):
+    def _download_free_awg_config(self, refreshed=False, on_done=None, source=None):
+        source = str(source or self._awg_free_source() or "vpgram").strip().lower()
+        if source not in ("vpgram", "warp"):
+            source = "vpgram"
+        is_warp = source == "warp"
+
+        def _done(ok):
+            if on_done is not None:
+                try:
+                    on_done(bool(ok))
+                except Exception:
+                    pass
+
         if bool(getattr(self, "_awg_config_downloading", False)):
+            _done(False)
             return
         self._awg_config_downloading = True
-        BulletinHelper.show_info("Получаю AWG конфиг...")
+        if not refreshed:
+            BulletinHelper.show_info("Регистрирую Cloudflare WARP..." if is_warp else "Получаю AWG конфиг...")
 
         def _worker():
+            ok = False
             try:
-                device_seed = hashlib.sha1(("%s:%s" % (time.time(), random.random())).encode("utf-8")).hexdigest()[:16]
-                req = urllib.request.Request(
-                    "https://web-api.vpgram.click/client-api/v1/download-anonymous-key",
-                    headers={"X-Device-Id": device_seed},
-                )
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                with urllib.request.urlopen(req, timeout=12, context=ctx) as resp:
-                    raw = resp.read(256 * 1024)
-                    text = raw.decode("utf-8", errors="ignore")
-                    filename = "VPgram_Free.conf"
-                    try:
-                        cd = str(resp.headers.get("content-disposition", "") or "")
-                        if "filename=" in cd:
-                            name = cd.split("filename=", 1)[1].strip("\"' ")
-                            if name:
-                                filename = name
-                    except:
-                        pass
-                if "[Interface]" not in text or "[Peer]" not in text:
-                    raise Exception("ответ не похож на .conf")
+                if is_warp:
+                    filename = WARP_CONF_NAME
+                    text = generate_warp_conf()
+                else:
+                    filename, text = self._fetch_vpgram_awg_config()
                 self._awg_conf_name = filename
                 self._awg_conf_content = text
+                self._awg_conf_is_free = True
+                self._awg_health_restarts = 0
+                self._awg_health_hold_until = 0.0
                 self._save_config()
-                run_on_ui_thread(lambda: BulletinHelper.show_success("AWG конфиг получен"))
+                run_on_ui_thread(lambda: BulletinHelper.show_success("Конфиг AWG обновлён" if refreshed else "AWG конфиг получен"))
                 if self._is_awg_mode_selected():
                     self._enable_plugin_proxy_flag()
                     self._ensure_awg_core_then(self._awg_connect)
                 run_on_ui_thread(lambda: self._refresh_settings_without_reopen(reload_main=True))
+                ok = True
             except Exception as exc:
-                err_text = str(exc)
-                run_on_ui_thread(lambda err_text=err_text: BulletinHelper.show_error("Не удалось получить AWG: %s" % err_text))
+                reason = getattr(exc, "reason", None)
+                if isinstance(exc, ssl.SSLCertVerificationError) or isinstance(reason, ssl.SSLCertVerificationError):
+                    cert_msg = "Не удалось проверить сертификат сервера WARP" if is_warp else "Не удалось проверить сертификат сервера AWG"
+                    run_on_ui_thread(lambda cert_msg=cert_msg: BulletinHelper.show_error(cert_msg))
+                else:
+                    err_text = str(exc)
+                    fail_fmt = "Не удалось зарегистрировать WARP: %s" if is_warp else "Не удалось получить AWG: %s"
+                    run_on_ui_thread(lambda err_text=err_text, fail_fmt=fail_fmt: BulletinHelper.show_error(fail_fmt % err_text))
             finally:
                 self._awg_config_downloading = False
+                _done(ok)
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _fetch_vpgram_awg_config(self):
+        device_seed = hashlib.sha1(("%s:%s" % (time.time(), random.random())).encode("utf-8")).hexdigest()[:16]
+        req = urllib.request.Request(
+            "https://web-api.vpgram.click/client-api/v1/download-anonymous-key",
+            headers={"X-Device-Id": device_seed},
+        )
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=12, context=ctx) as resp:
+            raw = resp.read(256 * 1024)
+            text = raw.decode("utf-8", errors="ignore")
+            filename = "VPgram_Free.conf"
+            try:
+                cd = str(resp.headers.get("content-disposition", "") or "")
+                if "filename=" in cd:
+                    name = cd.split("filename=", 1)[1].strip("\"' ")
+                    if name:
+                        filename = name
+            except:
+                pass
+        if "[Interface]" not in text or "[Peer]" not in text:
+            raise Exception("ответ не похож на .conf")
+        return filename, text
 
     def _clear_awg_config(self):
         self._awg_disconnect_with_reason("clear_awg_config", silent=True)
         self._awg_conf_name = ""
         self._awg_conf_content = ""
+        self._awg_conf_is_free = False
         self._save_config()
         self._refresh_settings_without_reopen(reload_main=True)
 
     def _restart_awg_from_settings(self):
+        self._native_start_guard_release()
         self._set_connection_mode(AWG_KIND)
         self._enable_plugin_proxy_flag()
         self._awg_disconnect_with_reason("restart_awg", silent=True)
@@ -4288,6 +4769,7 @@ Java.perform(function () {
         self._refresh_settings_without_reopen(reload_main=True, reload_stack=True)
 
     def _activate_vless_uri(self, uri, enable_plugin=True, reload_settings=True):
+        self._native_start_guard_release()
         existing = self._find_vless_node(uri)
         existing_kind = str((existing or {}).get("kind", "") or "").strip().lower()
         existing_from_subscription = False
@@ -4576,9 +5058,6 @@ Java.perform(function () {
         except:
             pass
 
-    def _should_arm_proxy_transition_killswitch(self, enabled, address, port, username, password, secret):
-        return True
-
     def _proxy_transition_accounts(self):
         # Every logged-in account keeps its own connection, not only the one on screen.
         # Only activated slots: getInstance() on an unused slot would spin up its native connection.
@@ -4610,23 +5089,41 @@ Java.perform(function () {
             return False
 
     def _set_proxy_transition_network_paused(self, paused):
+        # setAppPaused keeps a non-thread-safe resume counter, so every call goes through
+        # the UI thread, and pause/resume stay balanced: we resume exactly the accounts we
+        # paused, whatever the app state is by then. In the background Telegram has the
+        # network paused by itself; pausing there would unbalance its counter, so skip.
         if paused:
+            if self._is_app_backgrounded():
+                self._proxy_transition_paused_accounts = []
+                return
             accounts = self._proxy_transition_accounts()
             self._proxy_transition_paused_accounts = list(accounts)
         else:
             accounts = list(getattr(self, "_proxy_transition_paused_accounts", None) or [])
             self._proxy_transition_paused_accounts = []
-            # In background the app keeps its own connections paused and resumes them itself
-            # on return to foreground; resuming here would override that.
-            if self._is_app_backgrounded():
-                return
-        for account in accounts:
-            try:
-                cm = ConnectionsManager.getInstance(account)
-                if cm is not None:
-                    cm.setAppPaused(bool(paused), False)
-            except:
-                pass
+        if not accounts:
+            return
+        flag = bool(paused)
+
+        def _apply():
+            for account in accounts:
+                try:
+                    cm = ConnectionsManager.getInstance(account)
+                    if cm is not None:
+                        cm.setAppPaused(flag, False)
+                except:
+                    pass
+
+        if flag:
+            # The pause must be in effect before setProxySettings continues.
+            completed, _ = _gp_run_on_ui_wait(_apply, timeout=1.0)
+            if not completed:
+                self._proxy_transition_paused_accounts = []
+        elif _gp_is_ui_thread():
+            _apply()
+        else:
+            run_on_ui_thread(_apply)
 
     def _acquire_proxy_transition_killswitch(self, reason=""):
         with self._proxy_transition_state_lock:
@@ -4724,8 +5221,6 @@ Java.perform(function () {
         username = args[3] if len(args) > 3 else ""
         password = args[4] if len(args) > 4 else ""
         secret = args[5] if len(args) > 5 else ""
-        if not self._should_arm_proxy_transition_killswitch(enabled, address, port, username, password, secret):
-            return None
         return self._acquire_proxy_transition_killswitch("setProxySettings")
 
     def on_plugin_load(self):
@@ -4743,19 +5238,26 @@ Java.perform(function () {
             _set_subscription_hwid_custom(self.get_setting("subscription_hwid_custom", ""))
         except:
             pass
+        try:
+            self._set_setting_value("use_proxy", bool(self._desired_use_proxy), reload_settings=False)
+        except:
+            pass
         if self._core_restart_required():
             try:
-                self._set_setting_value("use_proxy", False, reload_settings=False)
                 _set_tg_proxy_enabled(False)
             except:
                 pass
             run_on_ui_thread(lambda: BulletinHelper.show_info("Обновление готово — перезапустите приложение. Настройки сохранены"))
-        elif self._core_restart_resumed:
+        self._install_plugin_proxy_api()
+        if not self._is_plugin_proxy_enabled():
             try:
-                self._set_setting_value("use_proxy", bool(self._desired_use_proxy), reload_settings=False)
+                self._clear_stale_greenpass_proxy()
             except:
                 pass
-        self._install_plugin_proxy_api()
+        try:
+            self._native_start_crash_check()
+        except Exception:
+            pass
 
         try:
             self.add_menu_item(
@@ -4788,7 +5290,8 @@ Java.perform(function () {
         self._install_proxy_button_hooks()
         self._install_sync_hooks()
         self._install_proxy_killswitch_hook()
-        self._install_ipv6_hook()
+        if not self._ipv6_enabled():
+            self._install_ipv6_hook()
         self._install_awg_activity_result_hook()
         self._install_browser_vless_hook()
         self._install_voip_relay_link_hook()
@@ -4808,16 +5311,19 @@ Java.perform(function () {
             self._refresh_olcrtc_subscriptions(silent=True)
 
         if (not self._is_proxy_policy_suspended()) and self._is_plugin_proxy_enabled() and self._is_vless_mode_selected():
-            self._ensure_vless_core_then(self._vless_connect)
+            if not self._auto_start_suppressed():
+                self._ensure_vless_core_then(self._vless_connect)
         elif (not self._is_proxy_policy_suspended()) and self._is_plugin_proxy_enabled() and self._is_tgws_mode_selected():
             self._tgws_connect()
         elif self._is_awg_mode_selected():
             if (not self._is_proxy_policy_suspended()) and self._is_plugin_proxy_enabled():
-                self._ensure_awg_config_then_connect()
+                if not self._auto_start_suppressed():
+                    self._ensure_awg_config_then_connect()
             elif not str(self._awg_conf_content or "").strip():
                 self._download_free_awg_config()
         elif (not self._is_proxy_policy_suspended()) and self._is_plugin_proxy_enabled() and self._is_olcrtc_mode_selected():
-            self._ensure_olcrtc_core_then(self._olcrtc_connect)
+            if not self._auto_start_suppressed():
+                self._ensure_olcrtc_core_then(self._olcrtc_connect)
 
         try:
             mc_class = find_class("org.telegram.messenger.MessagesController")
@@ -4826,8 +5332,6 @@ Java.perform(function () {
 
             for i in range(UserConfig.MAX_ACCOUNT_COUNT):
                 run_on_ui_thread(lambda i=i: NotificationCenter.getInstance(i).postNotificationName(NotificationCenter.dialogsNeedReload))
-
-            self._maybe_hide_proxy_sponsor_dialog()
         except Exception:
             pass
 
@@ -5069,12 +5573,29 @@ Java.perform(function () {
 
         def _worker():
             refreshed = {}
-            for url in urls:
-                text = _fetch_olcrtc_subscription_text(url, timeout_sec=15.0)
-                profiles = _extract_olcrtc_subscription_profiles(text, default_client_id=_get_or_create_olcrtc_device_id()) if text else []
-                if profiles:
-                    refreshed[url] = profiles
+            scheduled = False
+            try:
+                for url in urls:
+                    try:
+                        text = _fetch_olcrtc_subscription_text(url, timeout_sec=15.0)
+                        profiles = _extract_olcrtc_subscription_profiles(text, default_client_id=_get_or_create_olcrtc_device_id()) if text else []
+                    except Exception:
+                        profiles = []
+                    if profiles:
+                        refreshed[url] = profiles
+                scheduled = self._finish_olcrtc_subscription_refresh(refreshed, silent)
+            except Exception:
+                pass
+            finally:
+                if not scheduled:
+                    # _finish never ran: never leave the flag stuck for the whole process.
+                    self._olcrtc_subscription_refresh_in_progress = False
 
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
+
+    def _finish_olcrtc_subscription_refresh(self, refreshed, silent):
+        if True:
             def _finish():
                 self._olcrtc_subscription_refresh_in_progress = False
                 if not refreshed:
@@ -5104,9 +5625,7 @@ Java.perform(function () {
                     BulletinHelper.show_success("olcRTC подписки обновлены")
 
             run_on_ui_thread(_finish)
-
-        threading.Thread(target=_worker, daemon=True).start()
-        return True
+            return True
 
     def _apply_olcrtc_import_data(self, data, connect=True, imported_link=""):
         if not isinstance(data, dict):
@@ -5355,26 +5874,46 @@ Java.perform(function () {
         except Exception:
             return True
 
-    def _force_ipv4_strategy(self):
+    def _active_account_ids(self):
+        ids = []
         for account in range(int(UserConfig.MAX_ACCOUNT_COUNT)):
+            try:
+                if UserConfig.getInstance(account).isClientActivated():
+                    ids.append(account)
+            except Exception:
+                pass
+        return ids
+
+    def _should_force_ipv4(self):
+        try:
+            return (not self._ipv6_enabled()) or bool(getattr(self, "_awg_ipv4_only", False))
+        except Exception:
+            return False
+
+    def _force_ipv4_strategy(self):
+        for account in self._active_account_ids():
             try:
                 ConnectionsManager.native_setIpStrategy(account, 0)
             except Exception:
                 pass
+
+    def _check_all_connections(self):
+        def apply():
+            for account in self._active_account_ids():
+                try:
+                    ConnectionsManager.getInstance(account).checkConnection()
+                except Exception:
+                    pass
+        run_on_ui_thread(apply)
 
     def _on_ipv6_changed(self, enabled):
         try:
             self.set_setting("ipv6_enabled", bool(enabled), reload_settings=False)
         except Exception:
             pass
-        self._install_ipv6_hook()
-        def apply():
-            for account in range(int(UserConfig.MAX_ACCOUNT_COUNT)):
-                try:
-                    ConnectionsManager.getInstance(account).checkConnection()
-                except Exception:
-                    pass
-        run_on_ui_thread(apply)
+        if not enabled:
+            self._install_ipv6_hook()
+        self._check_all_connections()
         run_on_ui_thread(lambda: BulletinHelper.show_info("IPv6 включён" if enabled else "IPv6 выключен"))
 
     def _install_ipv6_hook(self):
@@ -5536,6 +6075,8 @@ Java.perform(function () {
 
     def _on_use_proxy_changed(self, enabled):
         val = bool(enabled)
+        if val:
+            self._native_start_guard_release()
         self._desired_use_proxy = bool(val)
         self._save_config()
         try:
@@ -5606,6 +6147,10 @@ Java.perform(function () {
         except Exception:
             pass
         self._active = False
+        try:
+            self._stop_awg_health_loop()
+        except:
+            pass
         self._remove_settings_theme_observer()
         try:
             self._worker_stop.set()
@@ -5623,12 +6168,15 @@ Java.perform(function () {
             self._release_all_proxy_transition_killswitches()
         except:
             pass
+        # Mark every mode as stopped first so clearing the proxy below cannot
+        # re-install the socket patch / autoload Frida script through the bridge sync.
         try:
-            self._remove_python_http_proxy_patch()
-        except:
-            pass
-        try:
-            self._deactivate_frida_plugin_proxy_hook()
+            self._vless_running = False
+            self._tgws_running = False
+            self._tgws_ready = False
+            self._awg_running = False
+            self._awg_connecting = False
+            self._olcrtc_running = False
         except:
             pass
         try:
@@ -5638,12 +6186,22 @@ Java.perform(function () {
         except:
             pass
         try:
-            self._vless_running = False
-            self._tgws_running = False
-            self._tgws_ready = False
-            self._awg_running = False
-            self._awg_connecting = False
-            self._olcrtc_running = False
+            # Also covers a loopback proxy applied by an earlier process.
+            self._clear_stale_greenpass_proxy()
+        except:
+            pass
+        try:
+            # Pure-Python listener: stop it off-thread so unload never blocks.
+            tgws_core = self._tgws_core
+            threading.Thread(target=lambda: tgws_core.stop(), daemon=True).start()
+        except:
+            pass
+        try:
+            self._remove_python_http_proxy_patch()
+        except:
+            pass
+        try:
+            self._deactivate_frida_plugin_proxy_hook()
         except:
             pass
         try:
@@ -5684,177 +6242,133 @@ Java.perform(function () {
             self._vless_backgrounded_at = 0.0
             self._tgws_backgrounded = False
             self._olcrtc_backgrounded = False
-            def _resume_bg():
-                try:
-                    self._apply_vpn_policy()
-                except:
-                    pass
-                if self._is_proxy_policy_suspended():
-                    self._olcrtc_resume_checking = False
-                    self._olcrtc_health_stale = False
-                    return
-                if not self._is_plugin_proxy_enabled():
-                    self._olcrtc_resume_checking = False
-                    self._olcrtc_health_stale = False
-                    return
-                if self._is_vless_mode_selected():
-                    if was_vless_backgrounded:
-                        self._resume_vless_after_background(vless_backgrounded_for)
-                    elif not self._is_vless_connection_ready(self._vless_port, check_tunnel=False):
-                        self._auto_reconnect_vless()
-                elif self._is_tgws_mode_selected():
-                    old_ready = bool(getattr(self, "_tgws_ready", False))
-                    ready_now = bool(self._tgws_ensure_local_proxy())
-                    if was_backgrounded or old_ready != ready_now:
-                        run_on_ui_thread(lambda: self._refresh_settings_without_reopen(reload_main=True, reload_stack=True))
-                    elif not ready_now and not bool(getattr(self, "_tgws_connecting", False)):
-                        self._tgws_heal_if_due()
-                        run_on_ui_thread(lambda: self._refresh_settings_without_reopen(reload_main=True, reload_stack=True))
-                elif self._should_run_awg() and not self._restore_running_awg_proxy(force_reapply=True):
-                    self._ensure_awg_core_then(self._awg_connect)
-                elif self._should_run_olcrtc():
-                    port = int(self._olcrtc_port or OLCRTC_LOCAL_PORT)
-                    local_alive = self._olcrtc_local_ready(port, check_tunnel=False, reason="resume")
-                    core_state = str(self._olcrtc_core_status_data().get("state", "") or "").lower()
-                    if local_alive and self._olcrtc_state_needs_restart(core_state):
-                        local_alive = False
-                    if local_alive:
-                        self._olcrtc_dead_checks = 0
-                        self._olcrtc_port = port
-                        self._olcrtc_running = True
-                        self._olcrtc_connecting = False
-                        self._olcrtc_health_stale = False
-                        self._olcrtc_resume_checking = False
-                        run_on_ui_thread(lambda: self._refresh_settings_without_reopen(reload_main=True, reload_stack=True))
-                    else:
-                        self._olcrtc_running = False
-                        self._olcrtc_resume_checking = False
-                        self._olcrtc_health_stale = False
-                        self._set_olcrtc_last_log("resume health check failed", event="resume_health_failed", port=port)
-                        core_state = str(self._olcrtc_core_status_data().get("state", "") or "").lower()
-                        if core_state not in ("starting", "handshake", "stopping") and not bool(getattr(self, "_olcrtc_connecting", False)):
-                            self._ensure_olcrtc_core_then(self._olcrtc_connect)
+            self._schedule_resume_bg(was_vless_backgrounded, vless_backgrounded_for, was_backgrounded)
+
+    def _schedule_resume_bg(self, was_vless_backgrounded, vless_backgrounded_for, was_backgrounded):
+        """RESUME/START events can fire in quick bursts; at most one resume worker runs, and
+        events that arrive meanwhile are merged into exactly one follow-up pass."""
+        with self._resume_bg_lock:
+            pending = self._resume_bg_args
+            if pending is None:
+                self._resume_bg_args = (bool(was_vless_backgrounded), float(vless_backgrounded_for), bool(was_backgrounded))
+            else:
+                self._resume_bg_args = (
+                    bool(pending[0] or was_vless_backgrounded),
+                    max(float(pending[1]), float(vless_backgrounded_for)),
+                    bool(pending[2] or was_backgrounded),
+                )
+            if self._resume_bg_running:
+                return
+            self._resume_bg_running = True
+
+        def _loop():
             try:
-                threading.Thread(target=_resume_bg, daemon=True).start()
-            except:
-                pass
-
-            self._maybe_hide_proxy_sponsor_dialog()
-
-    def _maybe_hide_proxy_sponsor_dialog(self):
-        try:
-            now = int(time.time())
-            if now - int(self._last_proxy_sponsor_hide or 0) < 30:
-                return
-
-            prefs = MessagesController.getGlobalMainSettings()
-            promo_id = int(prefs.getLong("proxy_dialog", 0))
-            promo_type = int(prefs.getInt("promo_dialog_type", -1))
-            proxy_type = int(getattr(MessagesController, "PROMO_TYPE_PROXY", 0))
-            if promo_id == 0 or promo_type != proxy_type:
-                return
-
-            self._last_proxy_sponsor_hide = now
-
-            def _hide_all():
-                for i in range(UserConfig.MAX_ACCOUNT_COUNT):
+                while True:
+                    with self._resume_bg_lock:
+                        args = self._resume_bg_args
+                        self._resume_bg_args = None
+                        if args is None:
+                            self._resume_bg_running = False
+                            return
                     try:
-                        mc = MessagesController.getInstance(i)
-                        if not mc:
-                            continue
-
-                        try:
-                            from hook_utils import get_private_field, set_private_field
-                            promo_dialog = None
-                            try:
-                                promo_dialog = get_private_field(mc, "promoDialog")
-                            except:
-                                promo_dialog = None
-                            if promo_dialog is None:
-                                try:
-                                    promo_dialog = mc.dialogs_dict.get(promo_id)
-                                except:
-                                    promo_dialog = None
-                                if promo_dialog is not None:
-                                    try:
-                                        set_private_field(mc, "promoDialog", promo_dialog)
-                                    except:
-                                        pass
-                        except:
-                            pass
-
-                        try:
-                            if hasattr(mc, "hidePromoDialog"):
-                                mc.hidePromoDialog()
-                        except:
-                            pass
-                    except:
+                        self._resume_bg_body(*args)
+                    except Exception:
                         pass
+            except BaseException:
+                with self._resume_bg_lock:
+                    self._resume_bg_running = False
+                raise
 
-            run_on_ui_thread(_hide_all)
-        except:
-            pass
+        try:
+            threading.Thread(target=_loop, daemon=True).start()
+        except Exception:
+            with self._resume_bg_lock:
+                self._resume_bg_running = False
 
-    def _start_thread(self):
-        if self._thread and self._thread.is_alive():
-            return
-        try:
-            self._worker_stop.clear()
-        except:
-            pass
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
-
-    def _worker(self):
-        self._worker_stop.wait(2)
-        if self._worker_stop.is_set() or (not self._active):
-            return
-        try:
-            self._run_autoupdate_check(force=False)
-        except:
-            pass
-        try:
-            self._update_outdated_core_in_background()
-        except:
-            pass
+    def _resume_bg_body(self, was_vless_backgrounded, vless_backgrounded_for, was_backgrounded):
         try:
             self._apply_vpn_policy()
         except:
             pass
-        if self._is_plugin_proxy_enabled() and not self._is_proxy_policy_suspended():
+        if self._is_proxy_policy_suspended():
+            self._olcrtc_resume_checking = False
+            self._olcrtc_health_stale = False
+            return
+        if not self._is_plugin_proxy_enabled():
+            self._olcrtc_resume_checking = False
+            self._olcrtc_health_stale = False
+            return
+        if self._is_vless_mode_selected():
+            if self._auto_start_suppressed():
+                return
+            if was_vless_backgrounded:
+                self._resume_vless_after_background(vless_backgrounded_for)
+            elif not self._is_vless_connection_ready(self._vless_port, check_tunnel=False):
+                self._auto_reconnect_vless()
+        elif self._is_tgws_mode_selected():
+            old_ready = bool(getattr(self, "_tgws_ready", False))
+            ready_now = bool(self._tgws_ensure_local_proxy())
+            if was_backgrounded or old_ready != ready_now:
+                run_on_ui_thread(lambda: self._refresh_settings_without_reopen(reload_main=True, reload_stack=True))
+            elif not ready_now and not bool(getattr(self, "_tgws_connecting", False)):
+                self._tgws_heal_if_due()
+                run_on_ui_thread(lambda: self._refresh_settings_without_reopen(reload_main=True, reload_stack=True))
+        elif self._should_run_awg():
+            if not self._restore_running_awg_proxy(force_reapply=True) and not self._auto_start_suppressed():
+                self._ensure_awg_core_then(self._awg_connect)
+        elif self._should_run_olcrtc():
+            port = int(self._olcrtc_port or OLCRTC_LOCAL_PORT)
+            local_alive = self._olcrtc_local_ready(port, check_tunnel=False, reason="resume")
+            core_state = str(self._olcrtc_core_status_data().get("state", "") or "").lower()
+            if local_alive and self._olcrtc_state_needs_restart(core_state):
+                local_alive = False
+            if local_alive:
+                self._olcrtc_dead_checks = 0
+                self._olcrtc_port = port
+                self._olcrtc_running = True
+                self._olcrtc_connecting = False
+                self._olcrtc_health_stale = False
+                self._olcrtc_resume_checking = False
+                run_on_ui_thread(lambda: self._refresh_settings_without_reopen(reload_main=True, reload_stack=True))
+            else:
+                self._olcrtc_running = False
+                self._olcrtc_resume_checking = False
+                self._olcrtc_health_stale = False
+                self._set_olcrtc_last_log("resume health check failed", event="resume_health_failed", port=port)
+                core_state = str(self._olcrtc_core_status_data().get("state", "") or "").lower()
+                if core_state not in ("starting", "handshake", "stopping") and not bool(getattr(self, "_olcrtc_connecting", False)) and not self._auto_start_suppressed():
+                    self._ensure_olcrtc_core_then(self._olcrtc_connect)
+
+    def _start_thread(self):
+        # Every run gets its own stop Event, so an old thread that is still busy
+        # in a long call can never swallow the restart of a new one.
+        stop = threading.Event()
+        try:
+            self._worker_stop.set()
+        except:
+            pass
+        self._worker_stop = stop
+        self._thread = threading.Thread(target=self._worker, args=(stop,), daemon=True)
+        self._thread.start()
+
+    def _worker(self, stop=None):
+        if stop is None:
+            stop = self._worker_stop
+        stop.wait(2)
+        if stop.is_set() or (not self._active):
+            return
+        try:
+            self._worker_startup()
+        except Exception as error:
             try:
-                self._maybe_run_vless_auto_ping()
+                self.log("GreenPass worker startup failed: %s" % error)
             except:
                 pass
-            if self._is_vless_mode_selected():
-                if not self._vless_running or (self._vless_port and not _check_vless_port(self._vless_port)):
-                    self._auto_reconnect_vless()
-            elif self._is_tgws_mode_selected():
-                self._tgws_ensure_local_proxy()
-            elif self._should_run_awg():
-                if not self._restore_running_awg_proxy():
-                    self._ensure_awg_core_then(self._awg_connect)
-            elif self._should_run_olcrtc():
-                if (not bool(getattr(self, "_olcrtc_backgrounded", False))) and (not bool(getattr(self, "_olcrtc_connecting", False))):
-                    port = int(self._olcrtc_port or OLCRTC_LOCAL_PORT)
-                    local_alive = self._olcrtc_local_ready(port, check_tunnel=False, reason="worker_start")
-                    core_state = str(self._olcrtc_core_status_data().get("state", "") or "").lower()
-                    if local_alive and self._olcrtc_state_needs_restart(core_state):
-                        local_alive = False
-                    if local_alive:
-                        self._olcrtc_dead_checks = 0
-                        self._olcrtc_port = port
-                        self._olcrtc_running = True
-                        self._olcrtc_health_stale = False
-                        self._olcrtc_resume_checking = False
-                    else:
-                        self._olcrtc_running = False
-                        self._ensure_olcrtc_core_then(self._olcrtc_connect)
 
-        while self._active:
+        while self._active and not stop.is_set():
             try:
-                self._worker_stop.wait(30)
-                if self._worker_stop.is_set() or (not self._active):
+                stop.wait(30)
+                if stop.is_set() or (not self._active):
                     break
 
                 try:
@@ -5902,7 +6416,9 @@ Java.perform(function () {
                     continue
 
                 if self._should_run_awg():
-                    if not self._restore_running_awg_proxy():
+                    if bool(getattr(self, "_awg_health_recovering", False)) or time.time() < float(getattr(self, "_awg_health_hold_until", 0.0) or 0.0):
+                        continue
+                    if not self._restore_running_awg_proxy() and not self._auto_start_suppressed():
                         self._ensure_awg_core_then(self._awg_connect)
                     continue
 
@@ -5929,18 +6445,57 @@ Java.perform(function () {
                         self._olcrtc_dead_checks = int(getattr(self, "_olcrtc_dead_checks", 0) or 0) + 1
                         if self._olcrtc_dead_checks >= 2:
                             self._olcrtc_dead_checks = 0
-                            self._ensure_olcrtc_core_then(self._olcrtc_connect)
+                            if not self._auto_start_suppressed():
+                                self._ensure_olcrtc_core_then(self._olcrtc_connect)
                     continue
 
             except Exception:
-                self._worker_stop.wait(60)
-                if self._worker_stop.is_set() or (not self._active):
+                stop.wait(60)
+                if stop.is_set() or (not self._active):
                     break
 
-
-
-
-
+    def _worker_startup(self):
+        try:
+            self._run_autoupdate_check(force=False)
+        except:
+            pass
+        try:
+            self._update_outdated_core_in_background()
+        except:
+            pass
+        try:
+            self._apply_vpn_policy()
+        except:
+            pass
+        if self._is_plugin_proxy_enabled() and not self._is_proxy_policy_suspended():
+            try:
+                self._maybe_run_vless_auto_ping()
+            except:
+                pass
+            if self._is_vless_mode_selected():
+                if not self._vless_running or (self._vless_port and not _check_vless_port(self._vless_port)):
+                    self._auto_reconnect_vless()
+            elif self._is_tgws_mode_selected():
+                self._tgws_ensure_local_proxy()
+            elif self._should_run_awg():
+                if not self._restore_running_awg_proxy() and not self._auto_start_suppressed():
+                    self._ensure_awg_core_then(self._awg_connect)
+            elif self._should_run_olcrtc():
+                if (not bool(getattr(self, "_olcrtc_backgrounded", False))) and (not bool(getattr(self, "_olcrtc_connecting", False))):
+                    port = int(self._olcrtc_port or OLCRTC_LOCAL_PORT)
+                    local_alive = self._olcrtc_local_ready(port, check_tunnel=False, reason="worker_start")
+                    core_state = str(self._olcrtc_core_status_data().get("state", "") or "").lower()
+                    if local_alive and self._olcrtc_state_needs_restart(core_state):
+                        local_alive = False
+                    if local_alive:
+                        self._olcrtc_dead_checks = 0
+                        self._olcrtc_port = port
+                        self._olcrtc_running = True
+                        self._olcrtc_health_stale = False
+                        self._olcrtc_resume_checking = False
+                    elif not self._auto_start_suppressed():
+                        self._olcrtc_running = False
+                        self._ensure_olcrtc_core_then(self._olcrtc_connect)
 
 
     def _restart_tgws_from_settings(self):

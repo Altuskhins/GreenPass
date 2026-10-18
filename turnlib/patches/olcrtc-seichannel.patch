@@ -1,43 +1,78 @@
-diff --git a/mobile/mobile.go b/mobile/mobile.go
-index 13e8c64..73ee42c 100644
---- a/mobile/mobile.go
-+++ b/mobile/mobile.go
-@@ -55,6 +55,7 @@ var (
- const (
- 	defaultTransport   = "vp8channel"
- 	dataTransport      = "datachannel"
-+	seiTransport       = "seichannel"
- 	defaultDNSServer   = "8.8.8.8:53"
- 	defaultHTTPPingURL = "https://www.google.com/generate_204"
- 	defaultSocksHost   = "127.0.0.1"
-@@ -117,7 +118,7 @@ func SetProviders() {
- }
+diff --git a/internal/protect/pionnet.go b/internal/protect/pionnet.go
+index abeb165..f8dbcd1 100644
+--- a/internal/protect/pionnet.go
++++ b/internal/protect/pionnet.go
+@@ -23,7 +23,7 @@ import (
+ 	"strings"
+ 	"syscall"
  
- // SetTransport selects the transport used by Start.
--// Supported values: vp8channel and datachannel.
-+// Supported values: vp8channel, datachannel and seichannel.
- func SetTransport(transport string) {
- 	mu.Lock()
- 	defer mu.Unlock()
-@@ -782,6 +783,8 @@ func normalizeTransport(value string) string {
- 		return dataTransport
- 	case defaultTransport, "vp8":
- 		return defaultTransport
-+	case seiTransport, "sei":
-+		return seiTransport
- 	default:
- 		return defaultTransport
- 	}
-diff --git a/mobile/mobile_test.go b/mobile/mobile_test.go
-index f40fe52..192cd8f 100644
---- a/mobile/mobile_test.go
-+++ b/mobile/mobile_test.go
-@@ -115,6 +115,8 @@ func TestNormalizeBuildRoomAndClamp(t *testing.T) {
- 		"dc":          dataTransport,
- 		"vp8channel":  defaultTransport,
- 		"vp8":         defaultTransport,
-+		"seichannel":  seiTransport,
-+		"sei":         seiTransport,
- 		"bad":         defaultTransport,
- 	}
- 	for in, want := range tests {
+-	"github.com/pion/transport/v4"
++	"github.com/pion/transport/v5"
+ )
+ 
+ // ErrUnexpectedConnType is returned when a protected listen/dial yields an
+diff --git a/internal/protect/pionnet_android.go b/internal/protect/pionnet_android.go
+index d5179be..174d979 100644
+--- a/internal/protect/pionnet_android.go
++++ b/internal/protect/pionnet_android.go
+@@ -95,7 +95,7 @@ import (
+ 	"net"
+ 	"unsafe"
+ 
+-	"github.com/pion/transport/v4"
++	"github.com/pion/transport/v5"
+ )
+ 
+ const android11ApiLevel = 30
+diff --git a/internal/protect/pionnet_android_netlink.go b/internal/protect/pionnet_android_netlink.go
+index 8e3c096..b259da3 100644
+--- a/internal/protect/pionnet_android_netlink.go
++++ b/internal/protect/pionnet_android_netlink.go
+@@ -8,7 +8,7 @@ import (
+ 	"fmt"
+ 	"net"
+ 
+-	"github.com/pion/transport/v4"
++	"github.com/pion/transport/v5"
+ )
+ 
+ // loadInterfacesNetlink enumerates interfaces through net.Interfaces(), which
+diff --git a/internal/protect/pionnet_android_nocgo.go b/internal/protect/pionnet_android_nocgo.go
+index e140a4c..bc72d0b 100644
+--- a/internal/protect/pionnet_android_nocgo.go
++++ b/internal/protect/pionnet_android_nocgo.go
+@@ -5,7 +5,7 @@
+ package protect
+ 
+ import (
+-	"github.com/pion/transport/v4"
++	"github.com/pion/transport/v5"
+ )
+ 
+ // loadInterfaces falls back to netlink on android without cgo.
+diff --git a/internal/protect/pionnet_default.go b/internal/protect/pionnet_default.go
+index 11b5fb0..4276489 100644
+--- a/internal/protect/pionnet_default.go
++++ b/internal/protect/pionnet_default.go
+@@ -7,7 +7,7 @@ package protect
+ import (
+ 	"fmt"
+ 
+-	"github.com/pion/transport/v4"
++	"github.com/pion/transport/v5"
+ 	"github.com/wlynxg/anet"
+ )
+ 
+diff --git a/internal/protect/pionnet_test.go b/internal/protect/pionnet_test.go
+index ae307ef..ff4df00 100644
+--- a/internal/protect/pionnet_test.go
++++ b/internal/protect/pionnet_test.go
+@@ -10,7 +10,7 @@ import (
+ 	"syscall"
+ 	"testing"
+ 
+-	"github.com/pion/transport/v4"
++	"github.com/pion/transport/v5"
+ )
+ 
+ func TestIsTunInterface(t *testing.T) {

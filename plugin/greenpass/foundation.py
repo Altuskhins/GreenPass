@@ -1,8 +1,8 @@
 __id__ = "GreenPass"
 __name__ = "GreenPass"
 __description__ = "Практически универсальный прокси плагин, поддержка протоколов vless/vmess/hysteria2/etc., встроенные tg-ws-proxy, AmneziaWG и olcrtc, а также полноценнымм проксированием звонков"
-__author__ = "@Altyplugins"
-__version__ = "2.6.0"
+__author__ = "@Altyplugins / Claude"
+__version__ = "2.6.1"
 __icon__ = "bratpass/0"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.5.3"
@@ -161,27 +161,59 @@ def _is_zh_language():
         return False
 
 
+_UI_LANG_TTL_SEC = 5.0
+_ui_lang_cache = {"lang": "", "ts": 0.0}
+_Z_MEMO_MAX = 4096
+_z_memo = {}
+
+
+def _invalidate_ui_lang_cache():
+    _ui_lang_cache["ts"] = 0.0
+
+
+def _ui_lang():
+    """Cached UI language ("ru" / "zh" / "en"); re-detected at most every few seconds."""
+    now = time.monotonic()
+    lang = _ui_lang_cache.get("lang") or ""
+    if lang and 0.0 <= now - float(_ui_lang_cache.get("ts", 0.0) or 0.0) < _UI_LANG_TTL_SEC:
+        return lang
+    if _is_ru_language():
+        lang = "ru"
+    elif _is_zh_language():
+        lang = "zh"
+    else:
+        lang = "en"
+    if lang != _ui_lang_cache.get("lang"):
+        _z_memo.clear()
+    _ui_lang_cache["lang"] = lang
+    _ui_lang_cache["ts"] = now
+    return lang
+
+
 def Z(value):
     text = str(value or "")
-    if _is_ru_language():
+    lang = _ui_lang()
+    if lang == "ru":
         return text
-    if _is_zh_language():
-        translated = TRANSLATIONS_ZH.get(text)
-        if translated is not None:
-            return translated
-        for source, target in TRANSLATION_PARTS_ZH:
-            text = text.replace(source, target)
-        for source, target in TRANSLATION_FRAGMENTS_ZH:
-            text = text.replace(source, target)
-        return text
-    translated = TRANSLATIONS_EN.get(text)
-    if translated is not None:
-        return translated
-    for source, target in TRANSLATION_PARTS_EN:
-        text = text.replace(source, target)
-    for source, target in TRANSLATION_FRAGMENTS_EN:
-        text = text.replace(source, target)
-    return text
+    memo_key = (lang, text)
+    cached = _z_memo.get(memo_key)
+    if cached is not None:
+        return cached
+    if lang == "zh":
+        full, parts, fragments = TRANSLATIONS_ZH, TRANSLATION_PARTS_ZH, TRANSLATION_FRAGMENTS_ZH
+    else:
+        full, parts, fragments = TRANSLATIONS_EN, TRANSLATION_PARTS_EN, TRANSLATION_FRAGMENTS_EN
+    result = full.get(text)
+    if result is None:
+        result = text
+        for source, target in parts:
+            result = result.replace(source, target)
+        for source, target in fragments:
+            result = result.replace(source, target)
+    if len(_z_memo) >= _Z_MEMO_MAX:
+        _z_memo.clear()
+    _z_memo[memo_key] = result
+    return result
 
 
 __description__ = Z(__description__)
@@ -206,13 +238,87 @@ def Switch(*args, **kwargs): return _localized_setting(_Switch, args, kwargs)
 def EditText(*args, **kwargs): return _localized_setting(_EditText, args, kwargs)
 
 
+def _gp_is_ui_thread():
+    try:
+        from android.os import Looper
+        return bool(Looper.myLooper() == Looper.getMainLooper())
+    except Exception:
+        return threading.current_thread() is threading.main_thread()
+
+
+def _gp_run_on_ui_wait(fn, timeout=3.0):
+    """Run fn on the UI thread and wait for it, at most `timeout` seconds.
+
+    Returns (completed, result). Called on the UI thread it just runs fn. If the
+    wait times out before the UI thread started fn, fn is cancelled and will not
+    run later. Never raises.
+    """
+    if _gp_is_ui_thread():
+        try:
+            return True, fn()
+        except Exception:
+            return True, None
+    done = threading.Event()
+    state = {"cancel": False, "started": False, "result": None}
+    guard = threading.Lock()
+
+    def _run():
+        with guard:
+            if state["cancel"]:
+                return
+            state["started"] = True
+        try:
+            state["result"] = fn()
+        except Exception:
+            state["result"] = None
+        finally:
+            done.set()
+
+    try:
+        run_on_ui_thread(_run)
+    except Exception:
+        return False, None
+    if done.wait(float(timeout)):
+        return True, state["result"]
+    with guard:
+        if not state["started"]:
+            state["cancel"] = True
+            return False, None
+    # fn is already running on the UI thread; give it a short grace period.
+    if done.wait(1.0):
+        return True, state["result"]
+    return False, None
+
+
+def _gp_bulletin(method, text, args, kwargs):
+    # Bulletins touch views: worker threads must post them to the UI thread.
+    try:
+        label = Z(text)
+    except Exception:
+        label = str(text or "")
+
+    def _show():
+        try:
+            return method(label, *args, **kwargs)
+        except Exception:
+            return None
+
+    if _gp_is_ui_thread():
+        return _show()
+    try:
+        run_on_ui_thread(_show)
+    except Exception:
+        pass
+    return None
+
+
 class BulletinHelper:
     @staticmethod
-    def show_info(text, *args, **kwargs): return _BulletinHelper.show_info(Z(text), *args, **kwargs)
+    def show_info(text, *args, **kwargs): return _gp_bulletin(_BulletinHelper.show_info, text, args, kwargs)
     @staticmethod
-    def show_error(text, *args, **kwargs): return _BulletinHelper.show_error(Z(text), *args, **kwargs)
+    def show_error(text, *args, **kwargs): return _gp_bulletin(_BulletinHelper.show_error, text, args, kwargs)
     @staticmethod
-    def show_success(text, *args, **kwargs): return _BulletinHelper.show_success(Z(text), *args, **kwargs)
+    def show_success(text, *args, **kwargs): return _gp_bulletin(_BulletinHelper.show_success, text, args, kwargs)
 
 
 class AlertDialogBuilder:
@@ -329,9 +435,18 @@ TGWS_HEAL_COOLDOWN_SEC = 8.0
 TGWS_BRIDGE_IDLE_TIMEOUT_SEC = 3600.0
 TGWS_WS_CONNECT_TIMEOUT_SEC = 5.0
 # After a WS failure the DC is still tried over WS, only with a shorter timeout.
-TGWS_WS_FAIL_TIMEOUT_SEC = 2.0
+# A cooling-down DC is still tried over WS, with a connect timeout that is not shorter
+# than the normal one: a slow link must not read as a dead one.
+TGWS_WS_FAIL_TIMEOUT_SEC = 5.0
 TGWS_WS_FAIL_COOLDOWN_SEC = 60.0
-TGWS_IP_FAIL_COOLDOWN_SEC = 3600.0
+# WS to an IP is skipped only briefly after a timeout (doubling per consecutive failure,
+# capped) and the memory is dropped after a quiet spell, so it heals by itself.
+TGWS_IP_FAIL_COOLDOWN_SEC = 60.0
+TGWS_IP_FAIL_COOLDOWN_MAX_SEC = 900.0
+TGWS_IP_FAIL_HEAL_IDLE_SEC = 300.0
+# Upstream WS sockets: bounded send, and the slice a reader holds the SSL object for.
+TGWS_WS_SEND_TIMEOUT_SEC = 30.0
+TGWS_SSL_IO_SLICE_SEC = 0.5
 TGWS_WS_BLACKLIST_TTL_SEC = 420.0
 TGWS_CFPROXY_CONNECT_TIMEOUT_SEC = 8.0
 TGWS_CFPROXY_429_COOLDOWN_SEC = 45.0
@@ -378,6 +493,11 @@ GREENPASS_EXPORT_FORMAT = "greenpass_export_v1"
 VLESS_EGRESS_TEST_TARGETS = [
     ("1.1.1.1", 80),
     ("1.0.0.1", 80),
+]
+# Telegram DCs: all Telegram needs from the tunnel is a TCP route to these.
+VLESS_TELEGRAM_TEST_TARGETS = [
+    ("149.154.167.51", 443),
+    ("149.154.175.50", 443),
 ]
 OLCRTC_TEST_TARGETS = [
     ("149.154.167.51", 443),

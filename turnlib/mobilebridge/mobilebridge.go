@@ -121,15 +121,19 @@ var (
 	persistentLogMu   sync.Mutex
 	persistentLogPath string
 
-	mobileStartWithTransport = startWithTransportFunc(olcmobile.StartWithTransport)
-	mobileWaitReady          = olcmobile.WaitReady
-	mobileStop               = olcmobile.Stop
-	mobileIsRunning          = olcmobile.IsRunning
-	mobileSetDebug           = olcmobile.SetDebug
-	mobileSetDNS             = olcmobile.SetDNS
-	mobileSetSocksListenHost = olcmobile.SetSocksListenHost
-	mobileSetVP8Options      = olcmobile.SetVP8Options
-	mobileSetLivenessOptions = olcmobile.SetLivenessOptions
+	olcRuntime = olcmobile.New()
+
+	mobileStartWithTransport = startWithTransportFunc(startOlcRuntime)
+	mobileWaitReady          = func(timeoutMillis int) error { return olcRuntime.WaitReady(timeoutMillis) }
+	mobileStop               = func() { logOlcErr("stop", olcRuntime.Stop(0)) }
+	mobileIsRunning          = func() bool { return olcRuntime.IsRunning() }
+	mobileSetDebug           = func(enabled bool) { olcRuntime.SetDebug(enabled) }
+	mobileSetDNS             = func(dns string) { logOlcErr("set dns", olcRuntime.SetDNS(dns)) }
+	mobileSetSocksListenHost = func(host string) { logOlcErr("set socks host", olcRuntime.SetSocksListenHost(host)) }
+	mobileSetVP8Options      = func(fps, batch int) { logOlcErr("set vp8 options", olcRuntime.SetVP8Options(fps, batch)) }
+	mobileSetLivenessOptions = func(interval, timeout, failures int) {
+		logOlcErr("set liveness options", olcRuntime.SetLivenessOptions(interval, timeout, failures))
+	}
 )
 
 type statusSnapshot struct {
@@ -161,7 +165,7 @@ func SetListener(l Listener) {
 
 // SetSocketProtector installs the Android socket protector used by olcRTC.
 func SetSocketProtector(p SocketProtector) {
-	olcmobile.SetProtector(p)
+	olcRuntime.SetProtector(p)
 }
 
 // SetLogLevel changes olcRTC/mobilebridge log verbosity.
@@ -640,7 +644,6 @@ func (r *olcRTCRunner) IsRunning() bool {
 }
 
 func setGlobalLogHandler() {
-	olcmobile.SetLogWriter(&olcRTCLogWriter{})
 	log.SetOutput(&stdLogBridge{})
 }
 
@@ -839,6 +842,59 @@ type olcRTCLogWriter struct{}
 
 func (w *olcRTCLogWriter) WriteLog(msg string) {
 	emitLog("", "info", msg)
+}
+
+// startOlcRTC adapts the legacy singleton-style start arguments to the
+// instance-based olcrtc mobile Runtime API.
+func startOlcRuntime(
+	carrierName string,
+	transportName string,
+	roomID string,
+	clientID string,
+	keyHex string,
+	socksPort int,
+	socksUser string,
+	socksPass string,
+) error {
+	if err := olcRuntime.SetProvider(carrierName); err != nil {
+		return err
+	}
+	if err := olcRuntime.SetTransport(normalizeOlcTransport(transportName)); err != nil {
+		return err
+	}
+	if err := olcRuntime.SetRoom(roomID); err != nil {
+		return err
+	}
+	olcRuntime.SetDeviceID(clientID)
+	if err := olcRuntime.SetKey(keyHex); err != nil {
+		return err
+	}
+	if err := olcRuntime.SetSocksPort(socksPort); err != nil {
+		return err
+	}
+	if err := olcRuntime.SetSocksCredentials(socksUser, socksPass); err != nil {
+		return err
+	}
+	return olcRuntime.Start()
+}
+
+func normalizeOlcTransport(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "datachannel", "dc":
+		return "datachannel"
+	case "seichannel", "sei":
+		return "seichannel"
+	case "videochannel", "video":
+		return "videochannel"
+	default:
+		return "vp8channel"
+	}
+}
+
+func logOlcErr(what string, err error) {
+	if err != nil {
+		emitLog("", "warn", fmt.Sprintf("olcrtc %s: %v", what, err))
+	}
 }
 
 type stdLogBridge struct{}

@@ -143,18 +143,90 @@ def _subscription_candidate_urls(url):
     return urls
 
 
-def _decode_subscription_body(raw, encoding=""):
+SUBSCRIPTION_MAX_BYTES = 8 * 1024 * 1024
+SUBSCRIPTION_FETCH_DEADLINE_SEC = 40.0
+
+
+class _SubscriptionLimitError(Exception):
+    pass
+
+
+def _gunzip_limited(data, limit):
+    """Incrementally gunzip `data`; raise _SubscriptionLimitError past `limit` output bytes."""
+    import zlib
+    out = []
+    total = 0
+    rest = bytes(data)
+    while rest:
+        dec = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        chunk = dec.decompress(rest, limit - total + 1)
+        total += len(chunk)
+        if total > limit:
+            raise _SubscriptionLimitError("gzip body too large")
+        out.append(chunk)
+        while dec.unconsumed_tail:
+            chunk = dec.decompress(dec.unconsumed_tail, limit - total + 1)
+            total += len(chunk)
+            if total > limit:
+                raise _SubscriptionLimitError("gzip body too large")
+            out.append(chunk)
+            if not chunk:
+                break
+        rest = dec.unused_data
+        if not dec.eof:
+            break
+        if rest[:2] != b"\x1f\x8b":
+            break
+    return b"".join(out)
+
+
+def _decode_subscription_body(raw, encoding="", max_bytes=None):
+    limit = int(max_bytes or SUBSCRIPTION_MAX_BYTES)
     data = bytes(raw or b"")
+    if len(data) > limit:
+        raise _SubscriptionLimitError("body too large")
     enc = str(encoding or "").lower().strip()
     if data[:2] == b"\x1f\x8b" or "gzip" in enc:
         try:
-            data = gzip.decompress(data)
-        except:
+            data = _gunzip_limited(data, limit)
+        except _SubscriptionLimitError:
+            raise
+        except Exception:
             pass
     try:
         return data.decode("utf-8")
     except:
         return data.decode("utf-8", errors="ignore")
+
+
+def _read_limited(resp, limit, deadline):
+    chunks = []
+    total = 0
+    # read1 returns after a single recv, so a slow-drip server cannot hold us past the deadline
+    reader = getattr(resp, "read1", None) or resp.read
+    while True:
+        if time.monotonic() > deadline:
+            raise TimeoutError("subscription fetch deadline exceeded")
+        chunk = reader(min(65536, limit + 1 - total))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise _SubscriptionLimitError("body too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+class _DeadlineRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = 5
+
+    def __init__(self, deadline):
+        self._deadline = deadline
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if time.monotonic() > self._deadline:
+            raise TimeoutError("subscription fetch deadline exceeded")
+        return urllib.request.HTTPRedirectHandler.redirect_request(self, req, fp, code, msg, headers, newurl)
 
 
 def _fetch_text_url(url, timeout_sec=15.0, request_headers=None):
@@ -173,67 +245,106 @@ def _fetch_text_url(url, timeout_sec=15.0, request_headers=None):
 
     errors = []
     candidate_urls = _subscription_candidate_urls(url)
+    limit = int(SUBSCRIPTION_MAX_BYTES)
+    deadline = time.monotonic() + float(SUBSCRIPTION_FETCH_DEADLINE_SEC)
 
+    def _diag_ok(candidate_url, current_timeout):
+        _set_vless_fetch_diag(
+            url,
+            stage="fetched",
+            fetched_url=str(candidate_url or ""),
+            timeout=float(current_timeout),
+            tried=len(candidate_urls),
+            errors=" | ".join(list(errors or [])[:4]),
+        )
+
+    def _note_error(prefix, candidate_url, e):
+        try:
+            host = str(urllib.parse.urlparse(str(candidate_url or "")).netloc or "").strip()
+        except:
+            host = ""
+        err = "%s@%s:%s" % (prefix, host or "?", str(type(e).__name__))
+        if err not in errors:
+            errors.append(err)
+
+    stop = False
     for candidate_url in candidate_urls:
+        if stop:
+            break
         headers = dict(request_headers) if isinstance(request_headers, dict) else _subscription_request_headers(candidate_url)
 
         for current_timeout in list(timeouts or [15.0]):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.5:
+                if "deadline" not in errors:
+                    errors.append("deadline")
+                stop = True
+                break
+            current_timeout = min(float(current_timeout), remaining)
+            urllib_timed_out = False
             try:
                 req = urllib.request.Request(str(candidate_url or ""), headers=headers)
                 ctx = ssl.create_default_context()
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
-                with urllib.request.urlopen(req, timeout=float(current_timeout), context=ctx) as resp:
-                    raw = resp.read()
+                opener = urllib.request.build_opener(
+                    urllib.request.HTTPSHandler(context=ctx),
+                    _DeadlineRedirectHandler(deadline),
+                )
+                with opener.open(req, timeout=float(current_timeout)) as resp:
+                    raw = _read_limited(resp, limit, deadline)
                     try:
                         encoding = str(resp.headers.get("Content-Encoding", "") or "")
                     except:
                         encoding = ""
-                    text = _decode_subscription_body(raw, encoding=encoding)
+                    text = _decode_subscription_body(raw, encoding=encoding, max_bytes=limit)
                     if text:
-                        _set_vless_fetch_diag(
-                            url,
-                            stage="fetched",
-                            fetched_url=str(candidate_url or ""),
-                            timeout=float(current_timeout),
-                            tried=len(candidate_urls),
-                            errors=" | ".join(list(errors or [])[:4]),
-                        )
+                        _diag_ok(candidate_url, current_timeout)
                         return text
+            except _SubscriptionLimitError as e:
+                _note_error("toolarge", candidate_url, e)
+                stop = True
+                break
             except Exception as e:
-                try:
-                    host = str(urllib.parse.urlparse(str(candidate_url or "")).netloc or "").strip()
-                except:
-                    host = ""
-                err = "urllib@%s:%s" % (host or "?", str(type(e).__name__))
-                if err not in errors:
-                    errors.append(err)
+                _note_error("urllib", candidate_url, e)
+                urllib_timed_out = isinstance(e, (socket.timeout, TimeoutError))
 
+            if urllib_timed_out or time.monotonic() >= deadline:
+                # a timeout would almost certainly repeat with requests; move on
+                continue
             try:
                 import requests
-                r = requests.get(str(candidate_url or ""), timeout=float(current_timeout), verify=False, headers=headers)
-                if int(getattr(r, "status_code", 0) or 0) == 200:
-                    raw = getattr(r, "content", b"") or b""
-                    encoding = str(getattr(getattr(r, "headers", {}), "get", lambda *a, **k: "")("Content-Encoding", "") or "")
-                    text = _decode_subscription_body(raw, encoding=encoding)
-                    if text:
-                        _set_vless_fetch_diag(
-                            url,
-                            stage="fetched",
-                            fetched_url=str(candidate_url or ""),
-                            timeout=float(current_timeout),
-                            tried=len(candidate_urls),
-                            errors=" | ".join(list(errors or [])[:4]),
-                        )
-                        return text
-            except Exception as e:
+                r = requests.get(str(candidate_url or ""), timeout=float(current_timeout), verify=False, headers=headers, stream=True)
                 try:
-                    host = str(urllib.parse.urlparse(str(candidate_url or "")).netloc or "").strip()
-                except:
-                    host = ""
-                err = "requests@%s:%s" % (host or "?", str(type(e).__name__))
-                if err not in errors:
-                    errors.append(err)
+                    if int(getattr(r, "status_code", 0) or 0) == 200:
+                        buf = []
+                        total = 0
+                        for piece in r.iter_content(65536):
+                            if time.monotonic() > deadline:
+                                raise TimeoutError("subscription fetch deadline exceeded")
+                            if not piece:
+                                continue
+                            total += len(piece)
+                            if total > limit:
+                                raise _SubscriptionLimitError("body too large")
+                            buf.append(piece)
+                        raw = b"".join(buf)
+                        encoding = str(getattr(getattr(r, "headers", {}), "get", lambda *a, **k: "")("Content-Encoding", "") or "")
+                        text = _decode_subscription_body(raw, encoding=encoding, max_bytes=limit)
+                        if text:
+                            _diag_ok(candidate_url, current_timeout)
+                            return text
+                finally:
+                    try:
+                        r.close()
+                    except:
+                        pass
+            except _SubscriptionLimitError as e:
+                _note_error("toolarge", candidate_url, e)
+                stop = True
+                break
+            except Exception as e:
+                _note_error("requests", candidate_url, e)
     _set_vless_fetch_diag(
         url,
         stage="fetch_failed",
@@ -1270,9 +1381,63 @@ def _xray_vless_links(outbound, profile_name=""):
     return links
 
 
+_SB_SUBSCRIPTION_OUTBOUND_TYPES = (
+    "vless", "vmess", "trojan", "shadowsocks", "hysteria2", "hysteria", "tuic", "anytls", "naive",
+)
+
+
+def _singbox_json_nodes(config):
+    """Nodes from a sing-box style config ({"outbounds": [{"type": "vless", ...}]}).
+
+    Each supported leaf outbound becomes a "singbox-config" node holding a
+    one-outbound config, the same node type that .singconf imports use.
+    """
+    if not isinstance(config, dict):
+        return []
+    raw_items = config.get("outbounds")
+    if isinstance(raw_items, list):
+        items = raw_items
+    elif str(config.get("type", "") or "").strip().lower() in _SB_SUBSCRIPTION_OUTBOUND_TYPES and not config.get("protocol"):
+        items = [config]
+    else:
+        return []
+    profile_name = str(config.get("remarks") or config.get("remark") or config.get("name") or "").strip()
+    nodes = []
+    for ob in items:
+        if not isinstance(ob, dict) or ob.get("protocol"):
+            continue
+        kind = str(ob.get("type", "") or "").strip().lower()
+        if kind not in _SB_SUBSCRIPTION_OUTBOUND_TYPES:
+            continue
+        server = str(ob.get("server", "") or "").strip()
+        try:
+            port = int(ob.get("server_port", 0) or 0)
+        except:
+            port = 0
+        if not port and ob.get("server_ports"):
+            port = 1
+        if not server or port <= 0 or ob.get("detour"):
+            continue
+        tag = str(ob.get("tag", "") or "").strip()
+        child = "" if (not tag or _is_generic_proxy_name(tag)) else tag
+        label = (profile_name + " " + child).strip() if (profile_name and child) else (child or profile_name or _proxy_address_name(server, port))
+        try:
+            single = dict(ob)
+            single["tag"] = "proxy"
+            node = _singbox_node_from_config_text(json.dumps({"outbounds": [single]}, ensure_ascii=False), name=label)
+        except Exception:
+            continue
+        node["kind"] = "singbox-config"
+        nodes.append(node)
+    return nodes
+
+
 def _xray_config_vless_nodes(config):
     if not isinstance(config, dict):
         return []
+    sb_nodes = _singbox_json_nodes(config)
+    if sb_nodes:
+        return sb_nodes
     profile_name = str(config.get("remarks") or config.get("remark") or config.get("name") or "").strip()
     if str(config.get("protocol", "") or ""):
         outbounds = [config]
@@ -1383,8 +1548,9 @@ def _fetch_vless_nodes(url, text=None):
             links = []
     try:
         if not links:
+            scheme_alt = "|".join(re.escape(item) for item in sorted(PROXY_URI_SCHEMES, key=len, reverse=True))
             links = re.findall(
-                r"(?:vless|vmess|trojan|ss|hy2|hysteria2|tuic|anytls|ssh|shadowtls|hysteria|naive|mieru)://[^\s\"'<>]+|https://(?:hvpn|hitray)\.io/[^\s\"'<>]+|hitvpn://[^\s\"'<>]+",
+                r"(?:" + scheme_alt + r")://[^\s\"'<>]+|https://(?:hvpn|hitray)\.io/[^\s\"'<>]+|hitvpn://[^\s\"'<>]+",
                 str(body or ""),
                 re.IGNORECASE,
             )

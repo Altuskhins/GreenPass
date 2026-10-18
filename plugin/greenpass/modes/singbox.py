@@ -16,6 +16,125 @@ class SingBoxModeMixin:
         except:
             return SINGBOX_SO_FILE
 
+    def _libsingbox_lock_obj(self):
+        lock = getattr(self, "_libsingbox_validation_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._libsingbox_validation_lock = lock
+        return lock
+
+    @staticmethod
+    def _libsingbox_verified_path(path):
+        return str(path) + ".verified"
+
+    def _libsingbox_cached_validity(self, cache_key):
+        """True/False when the integrity of this exact file (path, size, mtime) is known, else None.
+
+        Only tiny sections run under the lock; the 126 MB hash never does. Known results
+        live in the instance, in the process (they survive a plugin reload) and in a small
+        <so>.verified file, so a cold start does not hash the library again."""
+        lock = self._libsingbox_lock_obj()
+        with lock:
+            cached = self._libsingbox_validation_cache
+            if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == cache_key:
+                return bool(cached[1])
+        try:
+            known = getattr(_GP_PROCESS_STATE, "so_validity", None)
+            if isinstance(known, dict) and cache_key in known:
+                valid = bool(known[cache_key])
+                with lock:
+                    self._libsingbox_validation_cache = (cache_key, valid)
+                return valid
+        except Exception:
+            pass
+        try:
+            with open(self._libsingbox_verified_path(cache_key[0]), "r") as handle:
+                record = json.load(handle)
+            if (
+                isinstance(record, dict)
+                and int(record.get("size", -1)) == int(cache_key[1])
+                and int(record.get("mtime_ns", -1)) == int(cache_key[2])
+                and str(record.get("sha256", "")) == str(SINGBOX_SO_SHA256)
+            ):
+                self._libsingbox_store_validity(cache_key, True, persist=False)
+                return True
+        except Exception:
+            pass
+        return None
+
+    def _libsingbox_store_validity(self, cache_key, valid, persist=True):
+        valid = bool(valid)
+        lock = self._libsingbox_lock_obj()
+        with lock:
+            self._libsingbox_validation_cache = (cache_key, valid)
+            # A file of the expected size whose hash differs is corrupt, not just an
+            # older build (older builds differ in size): never dlopen that one.
+            self._libsingbox_corrupt_key = None if valid else cache_key
+        try:
+            known = getattr(_GP_PROCESS_STATE, "so_validity", None)
+            if not isinstance(known, dict):
+                known = {}
+                _GP_PROCESS_STATE.so_validity = known
+            known[cache_key] = valid
+        except Exception:
+            pass
+        if valid and persist:
+            try:
+                tmp = "%s.%d.tmp" % (self._libsingbox_verified_path(cache_key[0]), threading.get_ident())
+                with open(tmp, "w") as handle:
+                    json.dump({"size": int(cache_key[1]), "mtime_ns": int(cache_key[2]), "sha256": str(SINGBOX_SO_SHA256)}, handle)
+                os.replace(tmp, self._libsingbox_verified_path(cache_key[0]))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _libsingbox_cache_key(path):
+        stat = os.stat(path)
+        return (str(path), int(stat.st_size), int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1000000000)))), int(stat.st_size)
+
+    def _libsingbox_prime_validity(self, path):
+        """The caller just verified this file (hash checked while unpacking): record it."""
+        try:
+            cache_key, size = self._libsingbox_cache_key(path)
+            if int(size) == int(SINGBOX_SO_SIZE):
+                self._libsingbox_store_validity(cache_key, True)
+                return True
+        except Exception:
+            pass
+        self._libsingbox_validation_cache = None
+        return False
+
+    def _libsingbox_is_corrupt(self):
+        """Right size but wrong hash: a damaged file that must not be mapped."""
+        try:
+            cache_key, _ = self._libsingbox_cache_key(self._libsingbox_so_path())
+            return getattr(self, "_libsingbox_corrupt_key", None) == cache_key
+        except Exception:
+            return False
+
+    def _libsingbox_core_load_allowed(self):
+        """Call off the UI thread. False when dlopen of the file on disk is unsafe."""
+        try:
+            if _gp_core_loaded_in_process():
+                return True
+            if self._libsingbox_addon_status() != "outdated":
+                return True
+            return not self._libsingbox_is_corrupt()
+        except Exception:
+            return True
+
+    def _core_needs_restart_notice(self):
+        """The library on disk is not the one this process already runs: a second Go
+        runtime would crash it, so only an app restart can switch."""
+        try:
+            if not (_gp_core_loaded_in_process() and bool(getattr(_GP_PROCESS_STATE, "go_core_blocked", False))):
+                return False
+            if not self._core_restart_required():
+                self._mark_core_restart_required()
+            return True
+        except Exception:
+            return False
+
     def _libsingbox_addon_status(self, quick=False):
         if not SINGBOX_BUNDLE_FILE:
             return "missing"
@@ -28,15 +147,11 @@ class SingBoxModeMixin:
                 return "missing"
             if int(stat.st_size) != int(SINGBOX_SO_SIZE):
                 return "outdated"
-            cache_key = (str(path), int(stat.st_size), int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1000000000))))
-            lock = getattr(self, "_libsingbox_validation_lock", None)
-            if lock is None:
-                lock = threading.Lock()
-                self._libsingbox_validation_lock = lock
-            with lock:
-                cached = self._libsingbox_validation_cache
-                if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == cache_key:
-                    return "current" if cached[1] else "outdated"
+            cache_key, _ = self._libsingbox_cache_key(path)
+            lock = self._libsingbox_lock_obj()
+            cached = self._libsingbox_cached_validity(cache_key)
+            if cached is not None:
+                return "current" if cached else "outdated"
 
             if quick:
                 should_start = False
@@ -70,19 +185,25 @@ class SingBoxModeMixin:
                     threading.Thread(target=_validate_in_background, daemon=True).start()
                 return "checking"
 
-            with lock:
-                cached = self._libsingbox_validation_cache
-                if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == cache_key:
-                    return "current" if cached[1] else "outdated"
+            # Hashing is serialized by its own lock, never by the cache lock the UI thread uses.
+            hash_lock = getattr(self, "_libsingbox_hash_lock", None)
+            if hash_lock is None:
+                hash_lock = threading.Lock()
+                self._libsingbox_hash_lock = hash_lock
+            with hash_lock:
+                cached = self._libsingbox_cached_validity(cache_key)
+                if cached is not None:
+                    return "current" if cached else "outdated"
                 digest, size = self._sha256_file(path, max_bytes=int(SINGBOX_SO_SIZE))
                 valid = bool(size == int(SINGBOX_SO_SIZE) and digest == SINGBOX_SO_SHA256)
-                self._libsingbox_validation_cache = (cache_key, valid)
+                self._libsingbox_store_validity(cache_key, valid)
                 return "current" if valid else "outdated"
         except:
             return "missing"
 
     def _has_libsingbox_addon(self):
-        return self._libsingbox_addon_status() != "missing"
+        # quick: "checking" counts as present, so no caller (UI included) waits for a hash.
+        return self._libsingbox_addon_status(quick=True) != "missing"
 
     def _vless_disconnect_with_reason(self, reason, silent=False):
         self._vless_disconnect(silent=bool(silent))
@@ -93,10 +214,12 @@ class SingBoxModeMixin:
     def _vless_auto_subscription_nodes(self, uri=None):
         node = self._find_vless_node(uri if uri is not None else self._get_active_vless_uri())
         hidden = self._vless_browser_hidden_sources()
-        nodes = [
-            item for item in list((node or {}).get("balance_nodes", []) or [])
-            if isinstance(item, dict) and self._vless_browser_source_key(item) not in hidden
-        ]
+        all_nodes = [item for item in list((node or {}).get("balance_nodes", []) or []) if isinstance(item, dict)]
+        nodes = [item for item in all_nodes if self._vless_browser_source_key(item) not in hidden]
+        if not nodes and all_nodes:
+            # Every source is hidden: an empty Автовыбор would never connect again.
+            nodes = all_nodes
+            self._notify_all_sources_hidden()
         # ExitFy exposes failover as an explicit opt-in.  Keep the automatic
         # route deterministic when it is disabled instead of silently
         # rotating through every subscription node.
@@ -650,9 +773,26 @@ class SingBoxModeMixin:
             return False
         return True
 
+    def _notify_all_sources_hidden(self):
+        if getattr(self, "_all_sources_hidden_notified", False):
+            return
+        self._all_sources_hidden_notified = True
+        try:
+            run_on_ui_thread(lambda: BulletinHelper.show_info("Все источники скрыты — использую все узлы"))
+        except:
+            pass
+
     def _vless_balancer_nodes(self):
-        groups = []
         hidden = self._vless_browser_hidden_sources()
+        selected = self._vless_balancer_nodes_for(hidden)
+        if not selected and hidden:
+            selected = self._vless_balancer_nodes_for(set())
+            if selected:
+                self._notify_all_sources_hidden()
+        return selected
+
+    def _vless_balancer_nodes_for(self, hidden):
+        groups = []
         for sub in list(self._vless_data.get("subs", []) or []):
             sub_url = str((sub or {}).get("url", "") or "").strip()
             if sub_url and sub_url in hidden:
@@ -705,49 +845,68 @@ class SingBoxModeMixin:
             if require_vless_mode:
                 self._set_vless_connection_state(False, "Перезапустите приложение для смены ядра")
             return
-        self._vless_core._ensure()
+
+        def _prepare_and_run():
+            # Hashing, dlopen of the ~120 MB library and downloads happen on this
+            # worker thread, never on the caller's (possibly UI) thread.
+            try:
+                self._prepare_vless_core_and_run(runner, require_vless_mode)
+            except Exception as exc:
+                error_text = "Ошибка прокси: %s" % exc
+                if require_vless_mode:
+                    self._set_vless_connection_state(False, error_text)
+
+        try:
+            threading.Thread(target=_prepare_and_run, daemon=True).start()
+        except Exception:
+            pass
+
+    def _prepare_vless_core_and_run(self, runner, require_vless_mode):
+        if self._libsingbox_core_load_allowed():
+            self._vless_core._ensure()
         if self._vless_core.is_available():
             if require_vless_mode and (not self._should_run_vless()):
                 return
-            threading.Thread(target=runner, daemon=True).start()
+            runner()
+            return
+        if self._core_needs_restart_notice():
+            if require_vless_mode:
+                self._set_vless_connection_state(False, "Перезапустите приложение для нового ядра")
+            BulletinHelper.show_info("Ядро обновлено — перезапустите приложение")
             return
         if self._vless_prepare_in_progress:
             return
 
         self._set_core_download_in_progress(True)
         BulletinHelper.show_info("Скачиваю ядро прокси...")
-
-        def _worker():
-            try:
-                ok = self._download_libvless_with_progress()
-                if ok and self._core_restart_required():
-                    if require_vless_mode:
-                        self._set_vless_connection_state(False, "Перезапустите приложение для нового ядра")
-                    run_on_ui_thread(lambda: BulletinHelper.show_success("Ядро установлено — перезапустите приложение"))
+        try:
+            ok = self._download_libvless_with_progress()
+            if ok and self._core_restart_required():
+                if require_vless_mode:
+                    self._set_vless_connection_state(False, "Перезапустите приложение для нового ядра")
+                BulletinHelper.show_success("Ядро установлено — перезапустите приложение")
+                return
+            self._reload_vless_core()
+            self._vless_core._ensure()
+            if ok and self._vless_core.is_available():
+                if require_vless_mode and (not self._should_run_vless()):
                     return
-                self._reload_vless_core()
-                self._vless_core._ensure()
-                if ok and self._vless_core.is_available():
-                    if require_vless_mode and (not self._should_run_vless()):
-                        return
-                    run_on_ui_thread(lambda: BulletinHelper.show_success("Ядро прокси готово"))
-                    try:
-                        runner()
-                    except Exception as e:
-                        error_text = f"Ошибка прокси: {e}"
-                        if require_vless_mode:
-                            self._set_vless_connection_state(False, error_text)
-                        else:
-                            run_on_ui_thread(lambda text=error_text: BulletinHelper.show_error(text))
-                else:
+                BulletinHelper.show_success("Ядро прокси готово")
+                try:
+                    runner()
+                except Exception as e:
+                    error_text = f"Ошибка прокси: {e}"
                     if require_vless_mode:
-                        self._set_vless_connection_state(False, "Не удалось загрузить ядро прокси")
+                        self._set_vless_connection_state(False, error_text)
                     else:
-                        run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось загрузить ядро прокси"))
-            finally:
-                self._set_core_download_in_progress(False)
-
-        threading.Thread(target=_worker, daemon=True).start()
+                        BulletinHelper.show_error(error_text)
+            else:
+                if require_vless_mode:
+                    self._set_vless_connection_state(False, "Не удалось загрузить ядро прокси")
+                else:
+                    BulletinHelper.show_error("Не удалось загрузить ядро прокси")
+        finally:
+            self._set_core_download_in_progress(False)
 
     def _add_vless_manual_node(self, uri):
         node = _proxy_node_from_uri(uri)
@@ -787,6 +946,25 @@ class SingBoxModeMixin:
                 self._vless_connect_worker_active = False
             self._set_vless_connection_state(False, "Не удалось запустить подключение")
             return False
+
+    def _prune_invalid_auto_nodes(self, nodes, port, username, password):
+        good = []
+        for node in list(nodes or []):
+            try:
+                cfg, _ = _build_registered_proxy_config(
+                    str((node or {}).get("uri", "") or ""),
+                    port,
+                    socks_username=username,
+                    socks_password=password,
+                )
+                if not cfg:
+                    continue
+                if self._validate_core_config_for_import(cfg, "node"):
+                    continue
+                good.append(node)
+            except Exception:
+                continue
+        return good
 
     def _vless_connect_once(self):
         if not self._should_run_vless():
@@ -941,27 +1119,59 @@ class SingBoxModeMixin:
             self._abort_vless_generation(generation, port)
             self._set_vless_connection_state(False, "Не удалось разобрать ссылку")
             return False
+        def _singbox_runtime_patch(config_text):
+            runtime_config = json.loads(config_text)
+            log_config = runtime_config.get("log")
+            log_config = dict(log_config) if isinstance(log_config, dict) else {}
+            log_config.update({"disabled": False, "level": "info"})
+            runtime_config["log"] = log_config
+            experimental = runtime_config.get("experimental")
+            experimental = dict(experimental) if isinstance(experimental, dict) else {}
+            cache_file = experimental.get("cache_file")
+            cache_file = dict(cache_file) if isinstance(cache_file, dict) else {}
+            cache_file["path"] = os.path.join(self._vless_dir, "singbox-cache.db")
+            experimental["cache_file"] = cache_file
+            runtime_config["experimental"] = experimental
+            return json.dumps(runtime_config)
+
+        def _auto_pruned_config(nodes):
+            # One node the core cannot build must not take the whole Auto route down:
+            # keep only the nodes that pass the core's own check and rebuild.
+            can_prune = bool(use_sb and auto_nodes and len(auto_nodes) > 1 and not qwdtt_mode and not mihomo_mode
+                             and not is_file_config and not is_mihomo_config)
+            if not can_prune:
+                return None, None
+            good = self._prune_invalid_auto_nodes(nodes, port, username, password)
+            if not good or len(good) >= len(nodes):
+                return None, None
+            if len(good) > 1:
+                rebuilt = _build_singbox_balanced_config(good, port, socks_username=username, socks_password=password)
+            else:
+                rebuilt, _ = _build_registered_proxy_config(str(good[0].get("uri", "") or ""), port, socks_username=username, socks_password=password)
+            if not rebuilt:
+                return None, None
+            try:
+                return _singbox_runtime_patch(rebuilt), good
+            except Exception:
+                return None, None
+
         if use_sb and not qwdtt_mode and not mihomo_mode:
             try:
-                runtime_config = json.loads(single_config)
-                log_config = runtime_config.get("log")
-                log_config = dict(log_config) if isinstance(log_config, dict) else {}
-                log_config.update({"disabled": False, "level": "info"})
-                runtime_config["log"] = log_config
-                experimental = runtime_config.get("experimental")
-                experimental = dict(experimental) if isinstance(experimental, dict) else {}
-                cache_file = experimental.get("cache_file")
-                cache_file = dict(cache_file) if isinstance(cache_file, dict) else {}
-                cache_file["path"] = os.path.join(self._vless_dir, "singbox-cache.db")
-                experimental["cache_file"] = cache_file
-                runtime_config["experimental"] = experimental
-                single_config = json.dumps(runtime_config)
+                single_config = _singbox_runtime_patch(single_config)
             except Exception as exc:
                 self._abort_vless_generation(generation, port)
                 self._set_vless_connection_state(False, f"Ошибка конфига sing-box: {exc}")
                 return False
         if use_sb and not qwdtt_mode:
             validation_error = self._validate_core_config_for_import(single_config, mode_title)
+            if validation_error and str(validation_error).startswith("Ошибка конфига"):
+                retry_config, good_nodes = _auto_pruned_config(auto_nodes)
+                if retry_config:
+                    retry_error = self._validate_core_config_for_import(retry_config, mode_title)
+                    if not retry_error:
+                        single_config = retry_config
+                        auto_nodes = good_nodes
+                        validation_error = ""
             if validation_error:
                 self._abort_vless_generation(generation, port)
                 self._set_vless_connection_state(False, validation_error)
@@ -983,10 +1193,22 @@ class SingBoxModeMixin:
                     pass
                 return False
         else:
-            with self._vless_transition_lock:
-                if not self._same_vless_generation(generation) or not self._should_run_vless() or int(self._vless_port or 0) != int(port):
-                    return False
+            # StartCore can take seconds. It runs under the core-op lock (workers only,
+            # serializes it with stops) but NOT under _vless_transition_lock, so the UI
+            # thread, which takes that lock to disconnect, never waits for it.
+            # A disconnect that bumps the generation either runs its stop after this
+            # start (and stops it) or is seen by the re-check below (and nothing starts).
+            with self._vless_core_op_lock:
+                with self._vless_transition_lock:
+                    if not self._same_vless_generation(generation) or not self._should_run_vless() or int(self._vless_port or 0) != int(port):
+                        return False
                 err = self._vless_core.start(config_json)
+                if err and not any(token in str(err).lower() for token in ("address already in use", "eaddrinuse")):
+                    retry_config, good_nodes = _auto_pruned_config(auto_nodes)
+                    if retry_config:
+                        config_json = retry_config
+                        auto_nodes = good_nodes
+                        err = self._vless_core.start(config_json)
         bind_error = str(err or "").lower()
         if err and ("address already in use" in bind_error or "eaddrinuse" in bind_error):
             if self._abort_vless_generation(generation, port):
@@ -1006,19 +1228,33 @@ class SingBoxModeMixin:
                 ready_timeout = max(ready_timeout, float(VLESS_RESUME_AUTO_READY_TIMEOUT_SEC))
             deadline = time.time() + ready_timeout
             local_ready = False
-            while time.time() < deadline:
+            # The 1.1.1.1:80 probe must not be a hard gate: many Telegram-only exits
+            # block it. At the deadline, a working route to a Telegram DC is enough.
+            final_pass = False
+            while True:
+                if (not final_pass) and time.time() >= deadline:
+                    if (not local_ready) or mihomo_mode or qwdtt_mode:
+                        break
+                    if not _check_vless_telegram_route(port, timeout=1.5, username=username, password=password):
+                        break
+                    final_pass = True
                 if not self._same_vless_generation(generation) or int(self._vless_port or 0) != int(port) or not self._should_run_vless():
                     return
                 if _check_vless_port(port) and _check_vless_socks_ready(port, timeout=0.5, username=username, password=password):
                     local_ready = True
                     allow_waking_auto = resume_reconnect and uri == VLESS_AUTO_SUBSCRIPTIONS_URI
-                    if (not qwdtt_mode) and (not allow_waking_auto) and not _check_vless_tunnel_ready(port, timeout=1.5, username=username, password=password):
+                    if (not qwdtt_mode) and (not allow_waking_auto) and (not final_pass) and not _check_vless_tunnel_ready(port, timeout=1.5, username=username, password=password):
                         time.sleep(0.3)
                         continue
-                    with self._vless_transition_lock:
-                        if not self._same_vless_generation(generation) or int(self._vless_port or 0) != int(port) or not self._should_run_vless():
-                            return
-                        applied = self._vless_apply_tg_proxy(port, True, username=username, password=password)
+                    # Applying may hop to the UI thread, so the transition lock (which the
+                    # UI thread takes to disconnect) must not be held across it.
+                    if not self._same_vless_generation(generation) or int(self._vless_port or 0) != int(port) or not self._should_run_vless():
+                        return
+                    applied = self._vless_apply_tg_proxy(port, True, username=username, password=password)
+                    if applied and (not self._same_vless_generation(generation) or int(self._vless_port or 0) != int(port)):
+                        # Disconnected while applying: do not leave Telegram on a dead port.
+                        self._clear_local_socks_proxy_if_port(port, owner=VLESS_KIND)
+                        return
                     apply_deadline = time.time() + 1.5
                     while applied and time.time() < apply_deadline:
                         if not self._same_vless_generation(generation) or int(self._vless_port or 0) != int(port):
@@ -1038,11 +1274,23 @@ class SingBoxModeMixin:
                         self._vless_active_config_key = target_config_key
                         self._reset_vless_retry()
                         self._save_config()
-                    self._set_vless_connection_state(False, "")
+                    self._set_vless_connection_state(False, "Туннель не подтверждён" if final_pass else "")
                     return
+                if final_pass:
+                    break
                 time.sleep(0.3)
             if mihomo_mode and local_ready:
-                self._vless_retry_after = float("inf")
+                # Never park the retry timer at infinity: stop the core and back off
+                # finitely, so the worker keeps trying (with sing-box as the fallback).
+                if not self._abort_vless_generation(generation, port):
+                    return
+                if (not is_mihomo_config) and self._vless_engine == VLESS_ENGINE_MIHOMO:
+                    try:
+                        self._vless_engine = VLESS_ENGINE_SINGBOX
+                        self._save_config()
+                        self._reset_vless_retry()
+                    except:
+                        pass
                 self._set_vless_connection_state(False, "Прокси не работает. Попробуйте переключиться на ядро sing-box")
                 return
             if not self._abort_vless_generation(generation, port):
@@ -1052,12 +1300,40 @@ class SingBoxModeMixin:
         threading.Thread(target=_watchdog, daemon=True).start()
         return True
 
+    def _stop_vless_core_for_generation(self, generation, background=None):
+        """Stop the Go core on behalf of `generation`, only if nothing newer replaced it.
+
+        Order matters for the user: callers clear Telegram's proxy BEFORE this, so Telegram
+        never dials a dead port. On the UI thread the (possibly slow) StopCore runs on a
+        daemon thread. Core-op lock -> native lock; the transition lock is not taken here."""
+        if background is None:
+            background = _gp_is_ui_thread()
+
+        def _stop():
+            try:
+                with self._vless_core_op_lock:
+                    if int(self._vless_generation or 0) != int(generation):
+                        # A newer connect/disconnect owns the core now and stops it itself.
+                        return
+                    self._vless_core.stop()
+            except Exception:
+                pass
+
+        if background:
+            try:
+                threading.Thread(target=_stop, daemon=True).start()
+                return
+            except Exception:
+                pass
+        _stop()
+
     def _vless_disconnect(self, silent=False, cancel_pending=True):
         if cancel_pending:
             with self._vless_connect_lock:
                 self._vless_connect_pending = False
         with self._vless_transition_lock:
             self._vless_generation = int(self._vless_generation or 0) + 1
+            generation = int(self._vless_generation)
             old_port = int(self._vless_port or 0)
             old_owner = str(getattr(self, "_vless_local_owner", VLESS_KIND) or VLESS_KIND)
             self._vless_running = False
@@ -1068,12 +1344,13 @@ class SingBoxModeMixin:
             self._vless_socks_username = ""
             self._vless_active_config_key = ""
             self._vless_local_owner = VLESS_KIND
+        # Telegram's proxy first, then the core: no window where Telegram dials a dead port.
+        if old_port > 0:
             try:
-                self._vless_core.stop()
-            except:
-                pass
-            if old_port > 0:
                 self._clear_local_socks_proxy_if_port(old_port, owner=old_owner)
+            except Exception:
+                pass
+        self._stop_vless_core_for_generation(generation)
         if not silent:
             self._refresh_settings_without_reopen(reload_main=True, reload_stack=True)
 
@@ -1298,6 +1575,7 @@ class SingBoxModeMixin:
     def _switch_to_vless_mode(self, persist_mode=True):
         if self._go_core_switch_blocked("vless"):
             return
+        self._native_start_guard_release()
         if persist_mode:
             self._set_connection_mode(VLESS_KIND)
         try:
