@@ -79,7 +79,10 @@ for line in main.splitlines(keepends=True):
         continue
     if re.match(r"^__\w+__ = _foundation\.__\w+__$", s):
         continue
-    body.append(line.replace("_foundation.__name__", "__name__"))
+    line = line.replace("_foundation.__name__", "__name__")
+    # main.py reaches the WEB proxy class through its module alias; in the flat
+    # file the class is a plain global defined after SafeBypassPlugin.
+    body.append(line.replace("_webproxy.WebProxyNativePlugin(", "WebProxyNativePlugin("))
 if "_foundation" in "".join(body):
     raise SystemExit("unhandled _foundation reference in main.py")
 out.append("# --- main.py ---\n")

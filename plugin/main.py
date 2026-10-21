@@ -11,7 +11,9 @@ from .greenpass.modes.singbox import SingBoxModeMixin
 from .greenpass.modes.awg import AwgModeMixin
 from .greenpass.modes.olcrtc import OlcRtcModeMixin
 from .greenpass.modes.tgws import TgWsModeMixin
-from .greenpass.webproxy import WebProxyNativePlugin
+# Import the module, not the class: Elyx loads the first BasePlugin subclass it
+# finds in this module, and WebProxyNativePlugin must not be that class.
+from .greenpass import webproxy as _webproxy
 
 __id__ = _foundation.__id__
 __description__ = _foundation.__description__
@@ -71,7 +73,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         self._plugin_proxy_last_error = ""
         # WebProxy is an additional Telegram proxy type.  Keep its adapter state
         # alongside GreenPass so saved WEB relays survive plugin reloads.
-        self._webproxy = WebProxyNativePlugin()
+        self._webproxy = _webproxy.WebProxyNativePlugin()
 
         self._current_server = ""
         self._current_port = 0
@@ -3738,12 +3740,14 @@ Java.perform(function () {
     def _apply_local_socks_proxy(self, port, enable, owner=None, expected_port=None, username="", password="", secret=""):
         # SharedConfig.proxyList is a plain ArrayList that Telegram iterates on the UI
         # thread: mutating it from a worker can throw ConcurrentModificationException there.
-        # Hop to the UI thread (3 s at most) and run the whole body there. No plugin lock
-        # is held while waiting, so a UI caller can never deadlock against this wait.
+        # Hop to the UI thread and run the whole body there. No plugin lock is held while
+        # waiting, so a UI caller can never deadlock against this wait. The wait is long:
+        # during Telegram's startup the UI thread is busy for several seconds, and a short
+        # timeout cancelled the apply, leaving the core running with no proxy in Telegram.
         if not _gp_is_ui_thread():
             completed, result = _gp_run_on_ui_wait(
                 lambda: self._apply_local_socks_proxy_body(port, enable, owner, expected_port, username, password, secret),
-                timeout=3.0,
+                timeout=20.0,
             )
             return bool(result) if completed else False
         return self._apply_local_socks_proxy_body(port, enable, owner, expected_port, username, password, secret)
@@ -4675,9 +4679,9 @@ Java.perform(function () {
             run_on_ui_thread(lambda err_text=err_text: BulletinHelper.show_error("Ошибка чтения AWG: %s" % err_text))
 
     def _download_free_awg_config(self, refreshed=False, on_done=None, source=None):
-        source = str(source or self._awg_free_source() or "vpgram").strip().lower()
+        source = str(source or self._awg_free_source() or "warp").strip().lower()
         if source not in ("vpgram", "warp"):
-            source = "vpgram"
+            source = "warp"
         is_warp = source == "warp"
 
         def _done(ok):

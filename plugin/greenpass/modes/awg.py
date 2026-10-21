@@ -405,19 +405,19 @@ class AwgModeMixin:
 
     def _awg_free_source(self):
         try:
-            value = str(self.get_setting("awg_free_source", "vpgram") or "vpgram").strip().lower()
+            value = str(self.get_setting("awg_free_source", "warp") or "warp").strip().lower()
         except Exception:
-            value = "vpgram"
-        return value if value in ("vpgram", "warp") else "vpgram"
+            value = "warp"
+        return value if value in ("vpgram", "warp") else "warp"
 
     def _awg_free_source_index(self):
-        return 1 if self._awg_free_source() == "warp" else 0
+        return 0 if self._awg_free_source() == "warp" else 1
 
     def _on_awg_free_source_changed(self, index):
         try:
-            source = "warp" if int(index) == 1 else "vpgram"
+            source = "vpgram" if int(index) == 1 else "warp"
         except Exception:
-            source = "vpgram"
+            source = "warp"
         try:
             self._set_setting_value("awg_free_source", source, reload_settings=False)
         except Exception:

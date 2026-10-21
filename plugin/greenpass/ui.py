@@ -2905,7 +2905,7 @@ class SettingsUiMixin:
                 key="awg_free_source_idx",
                 text="Бесплатный конфиг",
                 default=self._sync_selector_index_setting("awg_free_source_idx", self._awg_free_source_index()),
-                items=["VPgram", "Cloudflare WARP"],
+                items=["Cloudflare WARP", "VPgram"],
                 icon="msg_list",
                 on_change=self._on_awg_free_source_changed,
             ),

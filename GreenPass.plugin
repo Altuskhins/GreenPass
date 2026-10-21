@@ -4,7 +4,7 @@ __id__ = "GreenPass"
 __name__ = "GreenPass"
 __description__ = "Практически универсальный прокси плагин, поддержка протоколов vless/vmess/hysteria2/etc., встроенные tg-ws-proxy, AmneziaWG и olcrtc, а также полноценнымм проксированием звонков"
 __author__ = "@Altyplugins / Claude"
-__version__ = "2.6.1"
+__version__ = "2.6.2"
 __icon__ = "bratpass/0"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.5.3"
@@ -1645,7 +1645,7 @@ _LAST_VLESS_FETCH_DIAG = {}
 
 PROXY_TRANSITION_KILLSWITCH_RESUME_DELAY_SEC = 0.12
 PROXY_TRANSITION_KILLSWITCH_FAILSAFE_SEC = 2.5
-PLUGIN_AUTOUPDATE_CHECK_INTERVAL_SEC = 20 * 60
+PLUGIN_AUTOUPDATE_CHECK_INTERVAL_SEC = 3 * 60 * 60
 
 
 def _is_tg_proxy_enabled():
@@ -13063,7 +13063,7 @@ class SettingsUiMixin:
                 key="awg_free_source_idx",
                 text="Бесплатный конфиг",
                 default=self._sync_selector_index_setting("awg_free_source_idx", self._awg_free_source_index()),
-                items=["VPgram", "Cloudflare WARP"],
+                items=["Cloudflare WARP", "VPgram"],
                 icon="msg_list",
                 on_change=self._on_awg_free_source_changed,
             ),
@@ -15588,19 +15588,19 @@ class AwgModeMixin:
 
     def _awg_free_source(self):
         try:
-            value = str(self.get_setting("awg_free_source", "vpgram") or "vpgram").strip().lower()
+            value = str(self.get_setting("awg_free_source", "warp") or "warp").strip().lower()
         except Exception:
-            value = "vpgram"
-        return value if value in ("vpgram", "warp") else "vpgram"
+            value = "warp"
+        return value if value in ("vpgram", "warp") else "warp"
 
     def _awg_free_source_index(self):
-        return 1 if self._awg_free_source() == "warp" else 0
+        return 0 if self._awg_free_source() == "warp" else 1
 
     def _on_awg_free_source_changed(self, index):
         try:
-            source = "warp" if int(index) == 1 else "vpgram"
+            source = "vpgram" if int(index) == 1 else "warp"
         except Exception:
-            source = "vpgram"
+            source = "warp"
         try:
             self._set_setting_value("awg_free_source", source, reload_settings=False)
         except Exception:
@@ -16710,6 +16710,8 @@ class TgWsModeMixin:
         self._refresh_settings_without_reopen(reload_main=True, reload_stack=True)
 
 # --- main.py ---
+# Import the module, not the class: Elyx loads the first BasePlugin subclass it
+# finds in this module, and WebProxyNativePlugin must not be that class.
 
 
 class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcModeMixin, TgWsModeMixin, BasePlugin):
@@ -20429,12 +20431,14 @@ Java.perform(function () {
     def _apply_local_socks_proxy(self, port, enable, owner=None, expected_port=None, username="", password="", secret=""):
         # SharedConfig.proxyList is a plain ArrayList that Telegram iterates on the UI
         # thread: mutating it from a worker can throw ConcurrentModificationException there.
-        # Hop to the UI thread (3 s at most) and run the whole body there. No plugin lock
-        # is held while waiting, so a UI caller can never deadlock against this wait.
+        # Hop to the UI thread and run the whole body there. No plugin lock is held while
+        # waiting, so a UI caller can never deadlock against this wait. The wait is long:
+        # during Telegram's startup the UI thread is busy for several seconds, and a short
+        # timeout cancelled the apply, leaving the core running with no proxy in Telegram.
         if not _gp_is_ui_thread():
             completed, result = _gp_run_on_ui_wait(
                 lambda: self._apply_local_socks_proxy_body(port, enable, owner, expected_port, username, password, secret),
-                timeout=3.0,
+                timeout=20.0,
             )
             return bool(result) if completed else False
         return self._apply_local_socks_proxy_body(port, enable, owner, expected_port, username, password, secret)
@@ -21366,9 +21370,9 @@ Java.perform(function () {
             run_on_ui_thread(lambda err_text=err_text: BulletinHelper.show_error("Ошибка чтения AWG: %s" % err_text))
 
     def _download_free_awg_config(self, refreshed=False, on_done=None, source=None):
-        source = str(source or self._awg_free_source() or "vpgram").strip().lower()
+        source = str(source or self._awg_free_source() or "warp").strip().lower()
         if source not in ("vpgram", "warp"):
-            source = "vpgram"
+            source = "warp"
         is_warp = source == "warp"
 
         def _done(ok):

@@ -2,7 +2,7 @@ __id__ = "GreenPass"
 __name__ = "GreenPass"
 __description__ = "Практически универсальный прокси плагин, поддержка протоколов vless/vmess/hysteria2/etc., встроенные tg-ws-proxy, AmneziaWG и olcrtc, а также полноценнымм проксированием звонков"
 __author__ = "@Altyplugins / Claude"
-__version__ = "2.6.1"
+__version__ = "2.6.2"
 __icon__ = "bratpass/0"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.5.3"
@@ -776,7 +776,7 @@ _LAST_VLESS_FETCH_DIAG = {}
 
 PROXY_TRANSITION_KILLSWITCH_RESUME_DELAY_SEC = 0.12
 PROXY_TRANSITION_KILLSWITCH_FAILSAFE_SEC = 2.5
-PLUGIN_AUTOUPDATE_CHECK_INTERVAL_SEC = 20 * 60
+PLUGIN_AUTOUPDATE_CHECK_INTERVAL_SEC = 3 * 60 * 60
 
 
 def _is_tg_proxy_enabled():
