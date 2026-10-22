@@ -4705,7 +4705,20 @@ Java.perform(function () {
                     filename = WARP_CONF_NAME
                     text = generate_warp_conf()
                 else:
-                    filename, text = self._fetch_vpgram_awg_config()
+                    try:
+                        filename, text = self._fetch_vpgram_awg_config()
+                    except Exception as vp_exc:
+                        # VPgram often has no free servers ("available_wg_server_not_found",
+                        # HTTP 406). Fall back to WARP and remember the choice, so the
+                        # health loop does not keep hitting a dead source.
+                        vp_text = str(vp_exc)
+                        run_on_ui_thread(lambda vp_text=vp_text: BulletinHelper.show_info("VPgram недоступен (%s) — использую Cloudflare WARP" % vp_text))
+                        try:
+                            self.set_setting("awg_free_source", "warp", reload_settings=False)
+                        except Exception:
+                            pass
+                        filename = WARP_CONF_NAME
+                        text = generate_warp_conf()
                 self._awg_conf_name = filename
                 self._awg_conf_content = text
                 self._awg_conf_is_free = True
@@ -4740,7 +4753,19 @@ Java.perform(function () {
             headers={"X-Device-Id": device_seed},
         )
         ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, timeout=12, context=ctx) as resp:
+        try:
+            resp_cm = urllib.request.urlopen(req, timeout=12, context=ctx)
+        except urllib.error.HTTPError as http_exc:
+            # The API explains failures in JSON: {"error": {"code", "localized_message"}}.
+            detail = ""
+            try:
+                payload = json.loads(http_exc.read(64 * 1024).decode("utf-8", errors="ignore") or "{}")
+                error = (payload or {}).get("error") or {}
+                detail = str(error.get("localized_message") or error.get("code") or "")
+            except Exception:
+                pass
+            raise Exception(detail or ("HTTP %s" % http_exc.code))
+        with resp_cm as resp:
             raw = resp.read(256 * 1024)
             text = raw.decode("utf-8", errors="ignore")
             filename = "VPgram_Free.conf"
