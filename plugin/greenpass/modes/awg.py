@@ -4,6 +4,7 @@ from ..tgws import *
 from ..native import *
 from ..subscriptions import *
 from ..hooks import *
+from ..warp import WARP_CONF_NAME, generate_warp_conf
 
 
 class AwgModeMixin:
@@ -195,3 +196,76 @@ class AwgModeMixin:
             self._enable_plugin_proxy_flag()
             self._ensure_awg_core_then(self._awg_connect)
         self._refresh_settings_without_reopen(reload_main=True, reload_stack=True)
+
+    # ---- AWG health check -------------------------------------------------
+    # A free config can die (server gone, key revoked) while the core keeps
+    # running, so Telegram sits on "Соединение..." until a reinstall. Once a
+    # minute, connect to a Telegram DC through the local AWG proxy; after 3
+    # failures in a row, regenerate the WARP config (or restart a user config).
+    _AWG_HEALTH_TARGETS = (("149.154.167.50", 443), ("149.154.175.50", 443))
+
+    def _awg_probe_once(self):
+        port = int(self._awg_port or AWG_LOCAL_PORT)
+        for host, dport in self._AWG_HEALTH_TARGETS:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=10.0) as sock:
+                    sock.settimeout(10.0)
+                    sock.sendall(b"\x05\x01\x00")
+                    if sock.recv(2) != b"\x05\x00":
+                        continue
+                    sock.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(host) + int(dport).to_bytes(2, "big"))
+                    head = sock.recv(4)
+                    if len(head) >= 2 and head[0] == 5 and head[1] == 0:
+                        return True
+            except Exception:
+                pass
+        return False
+
+    def _awg_health_fix(self):
+        if str(self._awg_conf_name or "") == WARP_CONF_NAME:
+            try:
+                text = generate_warp_conf()
+                self._awg_conf_content = text
+                self._save_config()
+                run_on_ui_thread(lambda: BulletinHelper.show_info("AWG не отвечал — создан новый WARP конфиг"))
+            except Exception as exc:
+                err_text = str(exc)
+                run_on_ui_thread(lambda err_text=err_text: BulletinHelper.show_error("Не удалось обновить WARP: %s" % err_text))
+        else:
+            run_on_ui_thread(lambda: BulletinHelper.show_info("AWG не отвечал — переподключаю"))
+        run_on_ui_thread(self._restart_awg_from_settings)
+
+    def _start_awg_health_thread(self):
+        if bool(getattr(self, "_awg_health_thread_started", False)):
+            return
+        self._awg_health_thread_started = True
+
+        def _loop():
+            fails = 0
+            last_fix = 0.0
+            while self._active:
+                time.sleep(60)
+                if not self._active:
+                    break
+                try:
+                    if (not self._is_awg_connection_ready()) or bool(getattr(self, "_awg_connecting", False)):
+                        fails = 0
+                        continue
+                    try:
+                        if not bool(ApplicationLoader.isNetworkOnline()):
+                            continue
+                    except Exception:
+                        pass
+                    if self._awg_probe_once():
+                        fails = 0
+                        continue
+                    fails += 1
+                    if fails < 3 or time.time() - last_fix < 600:
+                        continue
+                    fails = 0
+                    last_fix = time.time()
+                    self._awg_health_fix()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_loop, daemon=True).start()

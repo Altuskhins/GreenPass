@@ -4731,6 +4731,10 @@ Java.perform(function () {
     def on_plugin_load(self):
         self._active = True
         try:
+            self._start_awg_health_thread()
+        except Exception:
+            pass
+        try:
             self._webproxy.on_plugin_load()
         except Exception as error:
             try:

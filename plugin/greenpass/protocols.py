@@ -1804,8 +1804,8 @@ def _build_singbox_awg_config(conf_text, local_port):
         if psk:
             item["pre_shared_key"] = psk
         keepalive = str(peer.get("persistentkeepalive", "") or "").strip()
-        if keepalive:
-            item["persistent_keepalive_interval"] = int(keepalive)
+        # Keep the NAT mapping alive by default; an idle tunnel otherwise dies silently.
+        item["persistent_keepalive_interval"] = int(keepalive) if keepalive else 25
         sb_peers.append(item)
 
     endpoint = {
@@ -1827,6 +1827,10 @@ def _build_singbox_awg_config(conf_text, local_port):
     config = _sb_base_config(local_port)
     config["endpoints"] = [endpoint]
     config["route"]["final"] = "awg-out"
+    if not any(":" in item for item in addresses):
+        # IPv4-only tunnel: refuse IPv6 targets at once instead of failing each one
+        # with "missing IPv6 local address".
+        config["route"]["rules"].append({"ip_version": 6, "action": "reject"})
     dns = [item.strip() for item in str(interface.get("dns", "") or "").split(",") if item.strip()]
     if dns:
         config["dns"] = {"servers": [{"type": "udp", "tag": "awg-dns", "server": dns[0]}]}

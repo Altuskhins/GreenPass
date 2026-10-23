@@ -4,7 +4,7 @@ __id__ = "GreenPass"
 __name__ = "GreenPass"
 __description__ = "Практически универсальный прокси плагин, поддержка протоколов vless/vmess/hysteria2/etc., встроенные tg-ws-proxy, AmneziaWG и olcrtc, а также полноценнымм проксированием звонков"
 __author__ = "@Altyplugins / Claude"
-__version__ = "2.6.4"
+__version__ = "2.6.5"
 __icon__ = "bratpass/0"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.5.3"
@@ -3472,8 +3472,8 @@ def _build_singbox_awg_config(conf_text, local_port):
         if psk:
             item["pre_shared_key"] = psk
         keepalive = str(peer.get("persistentkeepalive", "") or "").strip()
-        if keepalive:
-            item["persistent_keepalive_interval"] = int(keepalive)
+        # Keep the NAT mapping alive by default; an idle tunnel otherwise dies silently.
+        item["persistent_keepalive_interval"] = int(keepalive) if keepalive else 25
         sb_peers.append(item)
 
     endpoint = {
@@ -3495,6 +3495,10 @@ def _build_singbox_awg_config(conf_text, local_port):
     config = _sb_base_config(local_port)
     config["endpoints"] = [endpoint]
     config["route"]["final"] = "awg-out"
+    if not any(":" in item for item in addresses):
+        # IPv4-only tunnel: refuse IPv6 targets at once instead of failing each one
+        # with "missing IPv6 local address".
+        config["route"]["rules"].append({"ip_version": 6, "action": "reject"})
     dns = [item.strip() for item in str(interface.get("dns", "") or "").split(",") if item.strip()]
     if dns:
         config["dns"] = {"servers": [{"type": "udp", "tag": "awg-dns", "server": dns[0]}]}
@@ -13653,6 +13657,239 @@ class SingBoxModeMixin:
         return False
 
 # --- bundled from greenpass.modes.awg.py ---
+# --- bundled from greenpass.warp.py ---
+"""Cloudflare WARP config generator (pure stdlib).
+
+Registers a fresh anonymous WARP device and renders a WireGuard/AmneziaWG .conf for it.
+Only the private key, the peer data and the interface addresses end up in the config;
+the registration id and token are deliberately dropped and never stored.
+"""
+import base64
+import binascii
+import datetime as _warp_dt
+import ipaddress
+import json
+import os
+import re
+import ssl
+import urllib.request
+
+WARP_API_URL = "https://api.cloudflareclient.com/v0a737/reg"
+WARP_USER_AGENT = "okhttp/3.12.1"
+WARP_TIMEOUT = 15
+WARP_MAX_RESPONSE = 256 * 1024
+WARP_DEFAULT_ENDPOINT = "engage.cloudflareclient.com:2408"
+WARP_CONF_NAME = "Cloudflare_WARP.conf"
+WARP_DNS = "1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001"
+WARP_MTU = 1280
+# Junk packets only: a plain WireGuard server ignores them. S1/S2/H1-H4 must stay at the
+# WireGuard defaults or the WARP server drops the handshake.
+WARP_OBFUSCATION = (("Jc", 4), ("Jmin", 40), ("Jmax", 70))
+
+_WARP_P = 2 ** 255 - 19
+_WARP_A24 = 121665
+_WARP_BASEPOINT = (9).to_bytes(32, "little")
+_WARP_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+
+
+class WarpError(Exception):
+    pass
+
+
+def _warp_x25519(k, u):
+    """RFC 7748 X25519 via the Montgomery ladder; k and u are 32-byte strings."""
+    if len(k) != 32 or len(u) != 32:
+        raise ValueError("X25519 inputs must be 32 bytes")
+    p = _WARP_P
+    kb = bytearray(k)
+    kb[0] &= 248
+    kb[31] &= 127
+    kb[31] |= 64
+    scalar = int.from_bytes(bytes(kb), "little")
+    ub = bytearray(u)
+    ub[31] &= 127
+    x1 = int.from_bytes(bytes(ub), "little") % p
+    x2, z2, x3, z3 = 1, 0, x1, 1
+    swap = 0
+    for t in range(254, -1, -1):
+        bit = (scalar >> t) & 1
+        swap ^= bit
+        if swap:
+            x2, x3 = x3, x2
+            z2, z3 = z3, z2
+        swap = bit
+        a = (x2 + z2) % p
+        aa = a * a % p
+        b = (x2 - z2) % p
+        bb = b * b % p
+        e = (aa - bb) % p
+        c = (x3 + z3) % p
+        d = (x3 - z3) % p
+        da = d * a % p
+        cb = c * b % p
+        x3 = (da + cb) ** 2 % p
+        z3 = x1 * (da - cb) ** 2 % p
+        x2 = aa * bb % p
+        z2 = e * (aa + _WARP_A24 * e) % p
+    if swap:
+        x2, x3 = x3, x2
+        z2, z3 = z3, z2
+    return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, "little")
+
+
+def warp_generate_keypair():
+    """Return (private_b64, public_b64): a clamped X25519 key from os.urandom, base64-encoded."""
+    priv = bytearray(os.urandom(32))
+    priv[0] &= 248
+    priv[31] &= 127
+    priv[31] |= 64
+    priv = bytes(priv)
+    pub = _warp_x25519(priv, _WARP_BASEPOINT)
+    return base64.b64encode(priv).decode("ascii"), base64.b64encode(pub).decode("ascii")
+
+
+def _warp_valid_key(value):
+    try:
+        return len(base64.b64decode(str(value), validate=True)) == 32
+    except (binascii.Error, ValueError, TypeError):
+        return False
+
+
+def _warp_valid_endpoint(value):
+    text = str(value or "").strip()
+    if text.startswith("["):
+        if "]:" not in text:
+            return False
+        host, port = text[1:].rsplit("]:", 1)
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            return False
+    else:
+        if text.count(":") != 1:
+            return False
+        host, port = text.split(":", 1)
+        if not _WARP_HOST_RE.match(host):
+            return False
+    return port.isdigit() and 1 <= int(port) <= 65535
+
+
+def _warp_valid_ip(value, version):
+    try:
+        return ipaddress.ip_address(str(value).strip()).version == version
+    except ValueError:
+        return False
+
+
+def _warp_dig(obj, *path):
+    for key in path:
+        if isinstance(key, int):
+            if not isinstance(obj, list) or key >= len(obj):
+                return None
+            obj = obj[key]
+        else:
+            if not isinstance(obj, dict):
+                return None
+            obj = obj.get(key)
+    return obj
+
+
+def _warp_parse_response(raw):
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise WarpError("ответ WARP не похож на JSON")
+    if not isinstance(data, dict):
+        raise WarpError("ответ WARP не похож на JSON-объект")
+    if data.get("success") is False:
+        msg = _warp_dig(data, "errors", 0, "message") or _warp_dig(data, "error", "message") or "отказ API"
+        raise WarpError("WARP отклонил регистрацию: %s" % str(msg)[:120])
+    peer_key = _warp_dig(data, "config", "peers", 0, "public_key")
+    if not isinstance(peer_key, str) or not _warp_valid_key(peer_key):
+        raise WarpError("в ответе WARP нет корректного public_key пира")
+    endpoint = _warp_dig(data, "config", "peers", 0, "endpoint", "host")
+    if endpoint is None or endpoint == "":
+        endpoint = WARP_DEFAULT_ENDPOINT
+    if not isinstance(endpoint, str) or not _warp_valid_endpoint(endpoint):
+        raise WarpError("в ответе WARP некорректный endpoint")
+    v4 = _warp_dig(data, "config", "interface", "addresses", "v4")
+    v6 = _warp_dig(data, "config", "interface", "addresses", "v6")
+    if not isinstance(v4, str) or not _warp_valid_ip(v4, 4):
+        raise WarpError("в ответе WARP нет корректного IPv4-адреса")
+    if not isinstance(v6, str) or not _warp_valid_ip(v6, 6):
+        raise WarpError("в ответе WARP нет корректного IPv6-адреса")
+    return {"public_key": peer_key.strip(), "endpoint": endpoint.strip(), "v4": v4.strip(), "v6": v6.strip()}
+
+
+def register_warp(timeout=WARP_TIMEOUT):
+    """Register a new anonymous WARP device. Returns a dict with the private key and the
+    peer/interface data needed by build_warp_conf. Raises WarpError on any failure."""
+    priv, pub = warp_generate_keypair()
+    now = _warp_dt.datetime.now(_warp_dt.timezone.utc)
+    tos = now.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (now.microsecond // 1000)
+    body = json.dumps({
+        "key": pub,
+        "install_id": "",
+        "fcm_token": "",
+        "warp_enabled": True,
+        "tos": tos,
+        "type": "Android",
+        "locale": "en_US",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        WARP_API_URL,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": WARP_USER_AGENT},
+    )
+    ctx = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            raw = resp.read(WARP_MAX_RESPONSE + 1)
+    except ssl.SSLCertVerificationError:
+        raise
+    except Exception as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            raise reason
+        if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError) or "timed out" in str(exc):
+            raise WarpError("таймаут запроса к Cloudflare")
+        raise WarpError(str(reason or exc) or exc.__class__.__name__)
+    if len(raw) > WARP_MAX_RESPONSE:
+        raise WarpError("слишком большой ответ WARP")
+    parsed = _warp_parse_response(raw)
+    parsed["private_key"] = priv
+    return parsed
+
+
+def build_warp_conf(private_key, peer_public_key, endpoint, v4, v6, obfuscation=True):
+    """Render the .conf text. Reg id / token are not part of it."""
+    lines = [
+        "[Interface]",
+        "PrivateKey = %s" % private_key,
+        "Address = %s/32, %s/128" % (v4, v6),
+        "DNS = %s" % WARP_DNS,
+        "MTU = %d" % WARP_MTU,
+    ]
+    if obfuscation:
+        lines.extend("%s = %d" % item for item in WARP_OBFUSCATION)
+    lines += [
+        "",
+        "[Peer]",
+        "PublicKey = %s" % peer_public_key,
+        "AllowedIPs = 0.0.0.0/0, ::/0",
+        "Endpoint = %s" % endpoint,
+        "PersistentKeepalive = 25",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def generate_warp_conf(timeout=WARP_TIMEOUT):
+    """Register and return the finished .conf text."""
+    reg = register_warp(timeout)
+    return build_warp_conf(reg["private_key"], reg["public_key"], reg["endpoint"], reg["v4"], reg["v6"])
+
 
 
 class AwgModeMixin:
@@ -13844,6 +14081,79 @@ class AwgModeMixin:
             self._enable_plugin_proxy_flag()
             self._ensure_awg_core_then(self._awg_connect)
         self._refresh_settings_without_reopen(reload_main=True, reload_stack=True)
+
+    # ---- AWG health check -------------------------------------------------
+    # A free config can die (server gone, key revoked) while the core keeps
+    # running, so Telegram sits on "Соединение..." until a reinstall. Once a
+    # minute, connect to a Telegram DC through the local AWG proxy; after 3
+    # failures in a row, regenerate the WARP config (or restart a user config).
+    _AWG_HEALTH_TARGETS = (("149.154.167.50", 443), ("149.154.175.50", 443))
+
+    def _awg_probe_once(self):
+        port = int(self._awg_port or AWG_LOCAL_PORT)
+        for host, dport in self._AWG_HEALTH_TARGETS:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=10.0) as sock:
+                    sock.settimeout(10.0)
+                    sock.sendall(b"\x05\x01\x00")
+                    if sock.recv(2) != b"\x05\x00":
+                        continue
+                    sock.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(host) + int(dport).to_bytes(2, "big"))
+                    head = sock.recv(4)
+                    if len(head) >= 2 and head[0] == 5 and head[1] == 0:
+                        return True
+            except Exception:
+                pass
+        return False
+
+    def _awg_health_fix(self):
+        if str(self._awg_conf_name or "") == WARP_CONF_NAME:
+            try:
+                text = generate_warp_conf()
+                self._awg_conf_content = text
+                self._save_config()
+                run_on_ui_thread(lambda: BulletinHelper.show_info("AWG не отвечал — создан новый WARP конфиг"))
+            except Exception as exc:
+                err_text = str(exc)
+                run_on_ui_thread(lambda err_text=err_text: BulletinHelper.show_error("Не удалось обновить WARP: %s" % err_text))
+        else:
+            run_on_ui_thread(lambda: BulletinHelper.show_info("AWG не отвечал — переподключаю"))
+        run_on_ui_thread(self._restart_awg_from_settings)
+
+    def _start_awg_health_thread(self):
+        if bool(getattr(self, "_awg_health_thread_started", False)):
+            return
+        self._awg_health_thread_started = True
+
+        def _loop():
+            fails = 0
+            last_fix = 0.0
+            while self._active:
+                time.sleep(60)
+                if not self._active:
+                    break
+                try:
+                    if (not self._is_awg_connection_ready()) or bool(getattr(self, "_awg_connecting", False)):
+                        fails = 0
+                        continue
+                    try:
+                        if not bool(ApplicationLoader.isNetworkOnline()):
+                            continue
+                    except Exception:
+                        pass
+                    if self._awg_probe_once():
+                        fails = 0
+                        continue
+                    fails += 1
+                    if fails < 3 or time.time() - last_fix < 600:
+                        continue
+                    fails = 0
+                    last_fix = time.time()
+                    self._awg_health_fix()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_loop, daemon=True).start()
 
 # --- bundled from greenpass.modes.olcrtc.py ---
 
@@ -14829,239 +15139,6 @@ class TgWsModeMixin:
         if self._is_plugin_proxy_enabled():
             self._tgws_connect()
         self._refresh_settings_without_reopen(reload_main=True, reload_stack=True)
-
-# --- bundled from greenpass.warp.py ---
-"""Cloudflare WARP config generator (pure stdlib).
-
-Registers a fresh anonymous WARP device and renders a WireGuard/AmneziaWG .conf for it.
-Only the private key, the peer data and the interface addresses end up in the config;
-the registration id and token are deliberately dropped and never stored.
-"""
-import base64
-import binascii
-import datetime as _warp_dt
-import ipaddress
-import json
-import os
-import re
-import ssl
-import urllib.request
-
-WARP_API_URL = "https://api.cloudflareclient.com/v0a737/reg"
-WARP_USER_AGENT = "okhttp/3.12.1"
-WARP_TIMEOUT = 15
-WARP_MAX_RESPONSE = 256 * 1024
-WARP_DEFAULT_ENDPOINT = "engage.cloudflareclient.com:2408"
-WARP_CONF_NAME = "Cloudflare_WARP.conf"
-WARP_DNS = "1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001"
-WARP_MTU = 1280
-# Junk packets only: a plain WireGuard server ignores them. S1/S2/H1-H4 must stay at the
-# WireGuard defaults or the WARP server drops the handshake.
-WARP_OBFUSCATION = (("Jc", 4), ("Jmin", 40), ("Jmax", 70))
-
-_WARP_P = 2 ** 255 - 19
-_WARP_A24 = 121665
-_WARP_BASEPOINT = (9).to_bytes(32, "little")
-_WARP_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
-
-
-class WarpError(Exception):
-    pass
-
-
-def _warp_x25519(k, u):
-    """RFC 7748 X25519 via the Montgomery ladder; k and u are 32-byte strings."""
-    if len(k) != 32 or len(u) != 32:
-        raise ValueError("X25519 inputs must be 32 bytes")
-    p = _WARP_P
-    kb = bytearray(k)
-    kb[0] &= 248
-    kb[31] &= 127
-    kb[31] |= 64
-    scalar = int.from_bytes(bytes(kb), "little")
-    ub = bytearray(u)
-    ub[31] &= 127
-    x1 = int.from_bytes(bytes(ub), "little") % p
-    x2, z2, x3, z3 = 1, 0, x1, 1
-    swap = 0
-    for t in range(254, -1, -1):
-        bit = (scalar >> t) & 1
-        swap ^= bit
-        if swap:
-            x2, x3 = x3, x2
-            z2, z3 = z3, z2
-        swap = bit
-        a = (x2 + z2) % p
-        aa = a * a % p
-        b = (x2 - z2) % p
-        bb = b * b % p
-        e = (aa - bb) % p
-        c = (x3 + z3) % p
-        d = (x3 - z3) % p
-        da = d * a % p
-        cb = c * b % p
-        x3 = (da + cb) ** 2 % p
-        z3 = x1 * (da - cb) ** 2 % p
-        x2 = aa * bb % p
-        z2 = e * (aa + _WARP_A24 * e) % p
-    if swap:
-        x2, x3 = x3, x2
-        z2, z3 = z3, z2
-    return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, "little")
-
-
-def warp_generate_keypair():
-    """Return (private_b64, public_b64): a clamped X25519 key from os.urandom, base64-encoded."""
-    priv = bytearray(os.urandom(32))
-    priv[0] &= 248
-    priv[31] &= 127
-    priv[31] |= 64
-    priv = bytes(priv)
-    pub = _warp_x25519(priv, _WARP_BASEPOINT)
-    return base64.b64encode(priv).decode("ascii"), base64.b64encode(pub).decode("ascii")
-
-
-def _warp_valid_key(value):
-    try:
-        return len(base64.b64decode(str(value), validate=True)) == 32
-    except (binascii.Error, ValueError, TypeError):
-        return False
-
-
-def _warp_valid_endpoint(value):
-    text = str(value or "").strip()
-    if text.startswith("["):
-        if "]:" not in text:
-            return False
-        host, port = text[1:].rsplit("]:", 1)
-        try:
-            ipaddress.IPv6Address(host)
-        except ValueError:
-            return False
-    else:
-        if text.count(":") != 1:
-            return False
-        host, port = text.split(":", 1)
-        if not _WARP_HOST_RE.match(host):
-            return False
-    return port.isdigit() and 1 <= int(port) <= 65535
-
-
-def _warp_valid_ip(value, version):
-    try:
-        return ipaddress.ip_address(str(value).strip()).version == version
-    except ValueError:
-        return False
-
-
-def _warp_dig(obj, *path):
-    for key in path:
-        if isinstance(key, int):
-            if not isinstance(obj, list) or key >= len(obj):
-                return None
-            obj = obj[key]
-        else:
-            if not isinstance(obj, dict):
-                return None
-            obj = obj.get(key)
-    return obj
-
-
-def _warp_parse_response(raw):
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        raise WarpError("ответ WARP не похож на JSON")
-    if not isinstance(data, dict):
-        raise WarpError("ответ WARP не похож на JSON-объект")
-    if data.get("success") is False:
-        msg = _warp_dig(data, "errors", 0, "message") or _warp_dig(data, "error", "message") or "отказ API"
-        raise WarpError("WARP отклонил регистрацию: %s" % str(msg)[:120])
-    peer_key = _warp_dig(data, "config", "peers", 0, "public_key")
-    if not isinstance(peer_key, str) or not _warp_valid_key(peer_key):
-        raise WarpError("в ответе WARP нет корректного public_key пира")
-    endpoint = _warp_dig(data, "config", "peers", 0, "endpoint", "host")
-    if endpoint is None or endpoint == "":
-        endpoint = WARP_DEFAULT_ENDPOINT
-    if not isinstance(endpoint, str) or not _warp_valid_endpoint(endpoint):
-        raise WarpError("в ответе WARP некорректный endpoint")
-    v4 = _warp_dig(data, "config", "interface", "addresses", "v4")
-    v6 = _warp_dig(data, "config", "interface", "addresses", "v6")
-    if not isinstance(v4, str) or not _warp_valid_ip(v4, 4):
-        raise WarpError("в ответе WARP нет корректного IPv4-адреса")
-    if not isinstance(v6, str) or not _warp_valid_ip(v6, 6):
-        raise WarpError("в ответе WARP нет корректного IPv6-адреса")
-    return {"public_key": peer_key.strip(), "endpoint": endpoint.strip(), "v4": v4.strip(), "v6": v6.strip()}
-
-
-def register_warp(timeout=WARP_TIMEOUT):
-    """Register a new anonymous WARP device. Returns a dict with the private key and the
-    peer/interface data needed by build_warp_conf. Raises WarpError on any failure."""
-    priv, pub = warp_generate_keypair()
-    now = _warp_dt.datetime.now(_warp_dt.timezone.utc)
-    tos = now.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (now.microsecond // 1000)
-    body = json.dumps({
-        "key": pub,
-        "install_id": "",
-        "fcm_token": "",
-        "warp_enabled": True,
-        "tos": tos,
-        "type": "Android",
-        "locale": "en_US",
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        WARP_API_URL,
-        data=body,
-        method="POST",
-        headers={"Content-Type": "application/json", "User-Agent": WARP_USER_AGENT},
-    )
-    ctx = ssl.create_default_context()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            raw = resp.read(WARP_MAX_RESPONSE + 1)
-    except ssl.SSLCertVerificationError:
-        raise
-    except Exception as exc:
-        reason = getattr(exc, "reason", None)
-        if isinstance(reason, ssl.SSLCertVerificationError):
-            raise reason
-        if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError) or "timed out" in str(exc):
-            raise WarpError("таймаут запроса к Cloudflare")
-        raise WarpError(str(reason or exc) or exc.__class__.__name__)
-    if len(raw) > WARP_MAX_RESPONSE:
-        raise WarpError("слишком большой ответ WARP")
-    parsed = _warp_parse_response(raw)
-    parsed["private_key"] = priv
-    return parsed
-
-
-def build_warp_conf(private_key, peer_public_key, endpoint, v4, v6, obfuscation=True):
-    """Render the .conf text. Reg id / token are not part of it."""
-    lines = [
-        "[Interface]",
-        "PrivateKey = %s" % private_key,
-        "Address = %s/32, %s/128" % (v4, v6),
-        "DNS = %s" % WARP_DNS,
-        "MTU = %d" % WARP_MTU,
-    ]
-    if obfuscation:
-        lines.extend("%s = %d" % item for item in WARP_OBFUSCATION)
-    lines += [
-        "",
-        "[Peer]",
-        "PublicKey = %s" % peer_public_key,
-        "AllowedIPs = 0.0.0.0/0, ::/0",
-        "Endpoint = %s" % endpoint,
-        "PersistentKeepalive = 25",
-        "",
-    ]
-    return "\n".join(lines)
-
-
-def generate_warp_conf(timeout=WARP_TIMEOUT):
-    """Register and return the finished .conf text."""
-    reg = register_warp(timeout)
-    return build_warp_conf(reg["private_key"], reg["public_key"], reg["endpoint"], reg["v4"], reg["v6"])
 
 # --- main.py ---
 # Import the module, not the class: Elyx loads the first BasePlugin subclass it
@@ -19775,6 +19852,10 @@ Java.perform(function () {
 
     def on_plugin_load(self):
         self._active = True
+        try:
+            self._start_awg_health_thread()
+        except Exception:
+            pass
         try:
             self._webproxy.on_plugin_load()
         except Exception as error:
