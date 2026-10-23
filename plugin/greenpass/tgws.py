@@ -1,10 +1,7 @@
 from .foundation import *
-from .protocols import _TGWS_TG_RANGES, _TGWS_IP_TO_DC
 import asyncio
-import concurrent.futures
 import importlib
 import logging
-import select
 
 log = logging.getLogger("greenpass.tgws")
 
@@ -81,17 +78,10 @@ class _TgWsH2Runtime:
         loop, pool = self.loop, self.pool
         if loop is None or pool is None or loop.is_closed():
             return None
-        future = None
         try:
             future = asyncio.run_coroutine_threadsafe(pool.open(int(dc), str(label)), loop)
             return future.result(timeout=12.0)
         except Exception as exc:
-            if future is not None:
-                # Do not leave a half-open channel coroutine running after the caller gave up.
-                try:
-                    future.cancel()
-                except Exception:
-                    pass
             log.debug("GreenPass HTTP/2 DC%d setup failed: %s", int(dc), exc)
             return None
 
@@ -121,7 +111,10 @@ class _TgWsH2Runtime:
     def bridge(self, conn, channel, streams, proto_int):
         loop = self.loop
         if loop is None or loop.is_closed():
-            # No loop to run channel.close() on: the caller falls back and drops the channel.
+            try:
+                asyncio.run_coroutine_threadsafe(channel.close(), loop).result(timeout=2)
+            except Exception:
+                pass
             return False
         try:
             conn.setblocking(False)
@@ -129,17 +122,7 @@ class _TgWsH2Runtime:
                 self._bridge_socket(conn, channel, streams, proto_int), loop
             )
             try:
-                # Poll instead of waiting forever: if the runtime is stopped (or the loop
-                # dies) the task is never resumed and its future would never complete,
-                # leaking this handler thread for good.
-                while True:
-                    try:
-                        future.result(timeout=1.0)
-                        break
-                    except concurrent.futures.TimeoutError:
-                        if self.loop is not loop or loop.is_closed() or not loop.is_running():
-                            future.cancel()
-                            break
+                future.result()
             except Exception as exc:
                 log.debug("GreenPass HTTP/2 media bridge ended: %s", exc)
             return True
@@ -163,19 +146,6 @@ class _TgWsH2Runtime:
             except Exception:
                 pass
         if not loop.is_closed():
-            # Cancel whatever is still pending (bridge tasks, connects) so their futures
-            # complete and no handler thread stays blocked on a task that never resumes.
-            async def _cancel_all():
-                tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-                for task in tasks:
-                    task.cancel()
-                if tasks:
-                    await asyncio.wait(tasks, timeout=2.0)
-
-            try:
-                asyncio.run_coroutine_threadsafe(_cancel_all(), loop).result(timeout=3.0)
-            except Exception:
-                pass
             try:
                 loop.call_soon_threadsafe(loop.stop)
             except Exception:
@@ -186,10 +156,7 @@ class _TgWsH2Runtime:
             except Exception:
                 pass
         try:
-            # close() raises while the loop is still running; closing only a stopped loop
-            # releases its selector and self-pipe fds.
-            if thread is None or not thread.is_alive():
-                loop.close()
+            loop.close()
         except Exception:
             pass
 
@@ -259,41 +226,6 @@ def _tgws_unique_values(*values):
     return out
 
 
-def _tgws_hard_close(target, courtesy=True):
-    """Close a socket (or a websocket-like object) so that threads blocked in recv()/send()
-    on it wake up. close() alone does not interrupt a blocked syscall on Linux and sends
-    no FIN while it is pending, so the socket is shut down first. The unbound
-    socket.socket.shutdown skips SSLSocket's TLS close_notify (which could block)."""
-    if target is None:
-        return
-    if isinstance(target, _TgWsRawWebSocket):
-        try:
-            target.close(courtesy=courtesy)
-        except Exception:
-            pass
-        return
-    if isinstance(target, socket.socket):
-        try:
-            socket.socket.shutdown(target, socket.SHUT_RDWR)
-        except Exception:
-            pass
-    try:
-        target.close()
-    except Exception:
-        pass
-
-
-def _tgws_set_send_timeout(sock, seconds):
-    """SO_SNDTIMEO: bounds only sends, so reads keep blocking without a timeout."""
-    try:
-        whole = int(seconds)
-        micro = int((float(seconds) - whole) * 1000000)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", whole, micro))
-        return True
-    except Exception:
-        return False
-
-
 def _tgws_set_socket_options(sock):
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -303,15 +235,6 @@ def _tgws_set_socket_options(sock):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     except:
         pass
-    # Android's default keepalive idle time is 2 hours: a path that died silently (Wi-Fi to
-    # LTE) would keep its bridge threads for that long. Detect it in about two minutes.
-    for opt_name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
-        try:
-            opt = getattr(socket, opt_name, None)
-            if opt is not None:
-                sock.setsockopt(socket.IPPROTO_TCP, opt, value)
-        except:
-            pass
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, int(TGWS_SOCKET_BUFFER_SIZE))
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(TGWS_SOCKET_BUFFER_SIZE))
@@ -874,66 +797,11 @@ def _tgws_ssl_context(check_hostname=True):
         return ctx
 
 
-class _TgWsSerializedSslReader(io.RawIOBase):
-    """Raw reader that lets one SSLSocket be read and written from two threads.
-
-    OpenSSL does not support concurrent SSL_read/SSL_write on one SSL object. Waiting for
-    data happens OUTSIDE the lock (select), so an idle reader never delays the writer; the
-    lock is held only for the short recv itself. A writer takes the same lock around its
-    sendall (see _TgWsRawWebSocket._sendall)."""
-
-    def __init__(self, sock, io_lock):
-        super().__init__()
-        self._sock = sock
-        self._io_lock = io_lock
-        self.deadline = None
-        self.aborted = False
-
-    def readable(self):
-        return True
-
-    def readinto(self, buf):
-        sock = self._sock
-        while True:
-            if self.aborted:
-                return 0
-            deadline = self.deadline
-            if deadline is not None and time.monotonic() >= deadline:
-                raise socket.timeout("timed out")
-            try:
-                waiting = sock.pending()
-            except Exception:
-                waiting = 0
-            if not waiting:
-                try:
-                    ready, _, _ = select.select([sock], [], [], float(TGWS_SSL_IO_SLICE_SEC))
-                except (OSError, ValueError):
-                    return 0
-                if not ready:
-                    continue
-            with self._io_lock:
-                if self.aborted:
-                    return 0
-                try:
-                    sock.settimeout(float(TGWS_SSL_IO_SLICE_SEC))
-                    return sock.recv_into(buf)
-                except (socket.timeout, ssl.SSLWantReadError, ssl.SSLWantWriteError):
-                    continue
-                except ssl.SSLZeroReturnError:
-                    return 0
-                except (OSError, ValueError):
-                    if self.aborted:
-                        return 0
-                    raise
-
-
 class _TgWsRawWebSocket:
-    def __init__(self, sock, reader, io_lock=None):
+    def __init__(self, sock, reader):
         self.sock = sock
         self.reader = reader
         self._lock = threading.Lock()
-        self._state_lock = threading.Lock()
-        self._io_lock = io_lock
         self._closed = False
         self._frag = bytearray()
 
@@ -942,7 +810,6 @@ class _TgWsRawWebSocket:
         sock = socket.create_connection((str(connect_host), 443 if secure else 80), timeout=float(timeout))
         wrapped = None
         reader = None
-        io_lock = None
         try:
             _tgws_set_socket_options(sock)
             if secure:
@@ -966,14 +833,7 @@ class _TgWsRawWebSocket:
                 "",
             ]).encode("utf-8")
             wrapped.sendall(req)
-            raw_reader = None
-            if secure:
-                io_lock = threading.RLock()
-                raw_reader = _TgWsSerializedSslReader(wrapped, io_lock)
-                raw_reader.deadline = time.monotonic() + float(timeout)
-                reader = io.BufferedReader(raw_reader, 64 * 1024)
-            else:
-                reader = wrapped.makefile("rb")
+            reader = wrapped.makefile("rb")
             status_line = reader.readline().decode("utf-8", errors="replace").strip()
             parts = status_line.split(" ", 2)
             code = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
@@ -987,51 +847,35 @@ class _TgWsRawWebSocket:
                     headers[str(k).strip().lower()] = str(v).strip()
             if code != 101:
                 raise _TgWsHandshakeError(code, status_line or "bad websocket handshake", headers, headers.get("location"))
-            if raw_reader is not None:
-                raw_reader.deadline = None
-            else:
-                wrapped.settimeout(None)
-                _tgws_set_send_timeout(wrapped, TGWS_WS_SEND_TIMEOUT_SEC)
-            return _TgWsRawWebSocket(wrapped, reader, io_lock)
+            wrapped.settimeout(None)
+            return _TgWsRawWebSocket(wrapped, reader)
         except:
-            try:
-                if reader is not None:
-                    try:
-                        reader.raw.aborted = True
-                    except Exception:
-                        pass
-            except:
-                pass
-            _tgws_hard_close(wrapped if wrapped is not None else sock)
             try:
                 if reader is not None:
                     reader.close()
             except:
                 pass
+            try:
+                if wrapped is not None:
+                    wrapped.close()
+                else:
+                    sock.close()
+            except:
+                pass
             raise
-
-    def _sendall(self, data):
-        # Caller holds self._lock (frame atomicity). For TLS, SSL I/O is additionally
-        # serialized with the reader; the send is bounded so it can never hang forever.
-        if self._io_lock is None:
-            self.sock.sendall(data)
-            return
-        with self._io_lock:
-            self.sock.settimeout(float(TGWS_WS_SEND_TIMEOUT_SEC))
-            self.sock.sendall(data)
 
     def send(self, payload):
         with self._lock:
             if self._closed:
                 raise EOFError("websocket closed")
-            self._sendall(_tgws_build_frame(0x2, payload, mask=True))
+            self.sock.sendall(_tgws_build_frame(0x2, payload, mask=True))
 
     def send_batch(self, parts):
         with self._lock:
             if self._closed:
                 raise EOFError("websocket closed")
             for payload in list(parts or []):
-                self._sendall(_tgws_build_frame(0x2, payload, mask=True))
+                self.sock.sendall(_tgws_build_frame(0x2, payload, mask=True))
 
     def _read_frame(self):
         header = _tgws_read_exact(self.reader, 2)
@@ -1077,57 +921,32 @@ class _TgWsRawWebSocket:
                 return message
 
     def _write_control(self, opcode, payload):
-        # A pong is optional: do not wait behind a writer that is stuck in a long send.
-        if not self._lock.acquire(timeout=1.0):
-            return
-        try:
+        with self._lock:
             if self._closed:
                 return
-            self._sendall(_tgws_build_frame(opcode, payload, mask=True))
-        finally:
-            self._lock.release()
+            self.sock.sendall(_tgws_build_frame(opcode, payload, mask=True))
 
-    def close(self, courtesy=True):
-        # Never waits for the send lock: a sender blocked in sendall holds it, and closing
-        # is exactly what has to unblock that sender (via shutdown below).
-        with self._state_lock:
+    def close(self):
+        with self._lock:
             if self._closed:
                 return
             self._closed = True
-        sock = self.sock
-        # Courtesy Close frame, only if nobody is mid-send.
-        if courtesy and self._lock.acquire(False):
             try:
-                io_lock = self._io_lock
-                if io_lock is None or io_lock.acquire(False):
-                    try:
-                        try:
-                            sock.settimeout(0.2)
-                        except:
-                            pass
-                        sock.sendall(_tgws_build_frame(0x8, b"", mask=True))
-                    except:
-                        pass
-                    finally:
-                        if io_lock is not None:
-                            try:
-                                io_lock.release()
-                            except:
-                                pass
-            finally:
-                self._lock.release()
-        try:
-            raw = getattr(self.reader, "raw", None)
-            if isinstance(raw, _TgWsSerializedSslReader):
-                raw.aborted = True
-        except:
-            pass
-        # Wakes any thread blocked in recv()/sendall() on this socket.
-        _tgws_hard_close(sock)
-        try:
-            self.reader.close()
-        except:
-            pass
+                self.sock.settimeout(0.2)
+            except:
+                pass
+            try:
+                self.sock.sendall(_tgws_build_frame(0x8, b"", mask=True))
+            except:
+                pass
+            try:
+                self.reader.close()
+            except:
+                pass
+            try:
+                self.sock.close()
+            except:
+                pass
 
 
 class _TgWsWsPool:
@@ -1154,7 +973,10 @@ class _TgWsWsPool:
             self.try_fronting_first = False
         for bucket in buckets:
             for ws, _ in list(bucket or []):
-                _tgws_hard_close(ws, courtesy=False)
+                try:
+                    ws.close()
+                except:
+                    pass
 
     def warmup(self, dc_ip):
         try:
@@ -1359,12 +1181,6 @@ class TgWsCore:
         self.fail_until = {}
         self.fail_count = {}
         self.ip_fail_until = {}
-        self.ip_fail_count = {}
-        self._last_ok_ts = time.monotonic()
-        # start()/stop() are serialized (the settings callbacks, the watchdog and the worker
-        # can all call them); _listener_lock guards only the listener hand-over.
-        self._life_lock = threading.RLock()
-        self._listener_lock = threading.Lock()
         self.ws_blacklist = set()
         self.ws_blacklist_until = {}
         self.ws_domain_pref = {}
@@ -1456,7 +1272,6 @@ class TgWsCore:
                 pass
             try:
                 self.ip_fail_until.clear()
-                self.ip_fail_count.clear()
             except:
                 pass
             try:
@@ -1492,22 +1307,10 @@ class TgWsCore:
             closers = list(self.tracked)
             self.tracked.clear()
         for closer in closers:
-            # Stopping: no graceful Close frames, just wake every blocked thread.
-            _tgws_hard_close(closer, courtesy=False)
-
-    def _ip_fail_record(self, target_ip):
-        # Escalating but bounded: 60 s, 120 s, ... capped; cleared on the first success.
-        try:
-            count = int(self.ip_fail_count.get(target_ip, 0) or 0) + 1
-            self.ip_fail_count[target_ip] = count
-            cooldown = min(float(TGWS_IP_FAIL_COOLDOWN_SEC) * (2 ** (min(count, 16) - 1)), float(TGWS_IP_FAIL_COOLDOWN_MAX_SEC))
-        except:
-            cooldown = float(TGWS_IP_FAIL_COOLDOWN_SEC)
-        self.ip_fail_until[target_ip] = time.monotonic() + cooldown
-
-    def _ip_fail_clear(self, target_ip):
-        self.ip_fail_until.pop(target_ip, None)
-        self.ip_fail_count.pop(target_ip, None)
+            try:
+                closer.close()
+            except:
+                pass
 
     def _ws_fail_record(self, dc_key):
         # While the cooldown lasts the DC is still tried over WS, just with
@@ -1581,16 +1384,11 @@ class TgWsCore:
     def start(self, config_json):
         if not self.is_available():
             return "Java crypto недоступно"
-        with self._life_lock:
-            return self._start_locked(config_json)
-
-    def _start_locked(self, config_json):
         try:
             cfg = self._parse_config(config_json)
             self.stop()
             listener = self._open_listener(int(cfg["port"]))
-            with self._listener_lock:
-                self.listener = listener
+            self.listener = listener
             self.port = int(cfg["port"])
             self.dc_ip = _tgws_normalize_dc_ip_map(cfg.get("dc_ip") or {}, with_defaults=False)
             self.pool_size = max(0, int(cfg.get("pool_size", TGWS_WS_POOL_SIZE) or 0))
@@ -1612,8 +1410,6 @@ class TgWsCore:
             self.fail_until.clear()
             self.fail_count.clear()
             self.ip_fail_until.clear()
-            self.ip_fail_count.clear()
-            self._last_ok_ts = time.monotonic()
             self.ws_domain_pref.clear()
             self.cf_429_until.clear()
             self.stop_event.clear()
@@ -1628,27 +1424,27 @@ class TgWsCore:
             self.cfproxy_refresh_thread.start()
             return ""
         except Exception as exc:
-            with self._listener_lock:
-                failed_listener = self.listener
-                self.listener = None
-            _tgws_hard_close(failed_listener)
+            try:
+                if self.listener is not None:
+                    self.listener.close()
+            except:
+                pass
+            self.listener = None
             return str(exc)
 
-    def request_stop(self):
-        """The non-blocking half of stop(): safe on the UI thread. Bumps the generation,
-        closes the listener and every live bridge (their blocked threads wake up) and returns
-        the generation token for finish_stop()."""
+    def stop(self):
         self.listener_generation += 1
-        token = int(self.listener_generation)
         self.stop_event.set()
         try:
             self.cfproxy_refresh_stop.set()
         except:
             pass
-        with self._listener_lock:
-            listener = self.listener
-            self.listener = None
-        _tgws_hard_close(listener)
+        try:
+            if self.listener is not None:
+                self.listener.close()
+        except:
+            pass
+        self.listener = None
         try:
             self.ws_pool.reset()
         except:
@@ -1658,36 +1454,24 @@ class TgWsCore:
         except:
             pass
         self._close_all_tracked()
-        return token
-
-    def finish_stop(self, token=None):
-        """The blocking half of stop(): joins the worker threads and stops the HTTP/2
-        runtime. Skipped when a newer start()/stop() superseded `token`."""
-        with self._life_lock:
-            if token is not None and int(token) != int(self.listener_generation):
-                return
-            thread = self.listener_thread
-            self.listener_thread = None
-            if thread is not None and thread.is_alive():
-                try:
-                    thread.join(1.5)
-                except:
-                    pass
-            refresh = self.cfproxy_refresh_thread
-            self.cfproxy_refresh_thread = None
-            if refresh is not None and refresh.is_alive():
-                try:
-                    refresh.join(1.0)
-                except:
-                    pass
+        thread = self.listener_thread
+        self.listener_thread = None
+        if thread is not None and thread.is_alive():
             try:
-                self.h2_runtime.stop()
+                thread.join(1.5)
             except:
                 pass
-
-    def stop(self):
-        token = self.request_stop()
-        self.finish_stop(token)
+        refresh = self.cfproxy_refresh_thread
+        self.cfproxy_refresh_thread = None
+        if refresh is not None and refresh.is_alive():
+            try:
+                refresh.join(1.0)
+            except:
+                pass
+        try:
+            self.h2_runtime.stop()
+        except:
+            pass
 
     def _open_listener(self, port):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1706,10 +1490,13 @@ class TgWsCore:
             raise
 
     def _restart_listener(self, generation):
-        with self._listener_lock:
-            old_listener = self.listener
-            self.listener = None
-        _tgws_hard_close(old_listener)
+        old_listener = self.listener
+        self.listener = None
+        try:
+            if old_listener is not None:
+                old_listener.close()
+        except:
+            pass
         if self.stop_event.wait(float(TGWS_LISTENER_RESTART_DELAY_SEC)):
             return False
         if int(generation) != int(self.listener_generation):
@@ -1718,56 +1505,36 @@ class TgWsCore:
             listener = self._open_listener(self.port)
         except:
             return False
-        # Re-check under the lock stop() uses, so a stop() that ran meanwhile can never be
-        # followed by an orphaned listener that stays bound with nobody accepting on it.
-        with self._listener_lock:
-            if not (self.stop_event.is_set() or int(generation) != int(self.listener_generation)):
-                self.listener = listener
-                return True
-        _tgws_hard_close(listener)
-        return False
-
-    def is_healthy(self):
-        # The listening socket can stay bound (and TCP probes keep succeeding) after the
-        # accept thread died, so health checks must look at the thread itself.
-        thread = self.listener_thread
-        return bool(thread is not None and thread.is_alive())
+        if self.stop_event.is_set() or int(generation) != int(self.listener_generation):
+            try:
+                listener.close()
+            except:
+                pass
+            return False
+        self.listener = listener
+        return True
 
     def _accept_loop(self, generation):
         while not self.stop_event.is_set() and int(generation) == int(self.listener_generation):
+            listener = self.listener
+            if listener is None:
+                self._restart_listener(generation)
+                continue
             try:
-                listener = self.listener
-                if listener is None:
-                    self._restart_listener(generation)
-                    continue
-                try:
-                    conn, _ = listener.accept()
-                except socket.timeout:
-                    continue
-                except:
-                    if self.stop_event.is_set() or int(generation) != int(self.listener_generation):
-                        break
-                    self._restart_listener(generation)
-                    continue
-                try:
-                    _tgws_set_socket_options(conn)
-                except:
-                    pass
-                self._track(conn)
-                try:
-                    threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
-                except Exception:
-                    # Thread/memory exhaustion: drop this connection, keep accepting.
-                    try:
-                        self._untrack(conn)
-                    except:
-                        pass
-                    _tgws_hard_close(conn)
-                    self.stop_event.wait(0.5)
-            except Exception:
-                # Never let one bad iteration kill the accept thread.
-                if self.stop_event.wait(0.5):
+                conn, _ = listener.accept()
+            except socket.timeout:
+                continue
+            except:
+                if self.stop_event.is_set() or int(generation) != int(self.listener_generation):
                     break
+                self._restart_listener(generation)
+                continue
+            try:
+                _tgws_set_socket_options(conn)
+            except:
+                pass
+            self._track(conn)
+            threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
 
     def _close_write(self, conn):
         try:
@@ -1783,12 +1550,9 @@ class TgWsCore:
                 clt_dec, clt_enc, tg_enc, tg_dec = streams
             except:
                 clt_dec = clt_enc = tg_enc = tg_dec = None
-        # A direction that stays silent for the idle timeout ends the bridge (the forwarders
-        # treat socket.timeout like any other error), so half-dead peers cannot pin
-        # threads and fds forever.
         for conn in (left, right):
             try:
-                conn.settimeout(TGWS_BRIDGE_IDLE_TIMEOUT_SEC)
+                conn.settimeout(None)
             except:
                 pass
 
@@ -1815,8 +1579,10 @@ class TgWsCore:
         # Both forwarders set `done` when they stop, so block instead of polling.
         done.wait()
         for item in (left, right):
-            # shutdown first: the other forwarder is blocked in recv() on one of them.
-            _tgws_hard_close(item)
+            try:
+                item.close()
+            except:
+                pass
             self._untrack(item)
 
     def _bridge_ws_split(self, client, ws, splitter, streams=None):
@@ -1829,7 +1595,7 @@ class TgWsCore:
             except:
                 clt_dec = clt_enc = tg_enc = tg_dec = None
         try:
-            client.settimeout(TGWS_BRIDGE_IDLE_TIMEOUT_SEC)
+            client.settimeout(None)
         except:
             pass
 
@@ -1890,7 +1656,10 @@ class TgWsCore:
         except:
             pass
         self._untrack(ws)
-        _tgws_hard_close(client)
+        try:
+            client.close()
+        except:
+            pass
         self._untrack(client)
         return downstream_seen.is_set()
 
@@ -2184,21 +1953,10 @@ class TgWsCore:
             except Exception:
                 pass
             now = time.monotonic()
-            if self.ip_fail_until and (now - float(self._last_ok_ts)) > float(TGWS_IP_FAIL_HEAL_IDLE_SEC):
-                # Nothing was bridged for minutes: the failure memory is stale. Forget it
-                # so WS gets another chance without waiting for the cooldown to expire.
-                self.ip_fail_until.clear()
-                self.ip_fail_count.clear()
-                self._last_ok_ts = now
-                try:
-                    self.ws_pool.reset()
-                except:
-                    pass
             ip_blocked = now < float(self.ip_fail_until.get(target_ip, 0.0) or 0.0)
             any_cf_fallback = bool(self.cfproxy_enabled) or bool(str(self.cfproxy_worker_domain or "").strip())
             fail_until = float(self.fail_until.get(dc_key, 0.0) or 0.0)
-            ws_timeout = max(TGWS_WS_FAIL_TIMEOUT_SEC, 5.0) if fail_until > time.time() else TGWS_WS_CONNECT_TIMEOUT_SEC
-            ws_from_pool = False
+            ws_timeout = TGWS_WS_FAIL_TIMEOUT_SEC if fail_until > time.time() else TGWS_WS_CONNECT_TIMEOUT_SEC
             ws_path = TGWS_WS_PATH_TEST if is_test_dc else TGWS_WS_PATH
             ws = None
             ws_failed_redirect = False
@@ -2218,7 +1976,6 @@ class TgWsCore:
                 ws = None if is_test_dc else self.ws_pool.get(dc, is_media, target_ip, domains)
                 if ws is not None:
                     all_redirects = False
-                    ws_from_pool = True
             except:
                 ws = None
 
@@ -2232,7 +1989,7 @@ class TgWsCore:
                 ws_timed_out = False
             if ws is None:
                 if ws_timed_out:
-                    self._ip_fail_record(target_ip)
+                    self.ip_fail_until[target_ip] = time.monotonic() + float(TGWS_IP_FAIL_COOLDOWN_SEC)
                 try:
                     if ws_failed_redirect and all_redirects:
                         self._ws_blacklist_add(dc_key)
@@ -2241,7 +1998,7 @@ class TgWsCore:
                 self._ws_fail_record(dc_key)
                 self._fallback(conn, dst, port, init_packet, dc, is_media, proto_int, allow_cf=not priority_cf_tried, streams=streams, is_test_dc=is_test_dc)
                 return
-            self._ip_fail_clear(target_ip)
+            self.ip_fail_until.pop(target_ip, None)
             self.ws_pool.report_success((int(dc), bool(is_media), str(target_ip)))
             self._track(ws)
             try:
@@ -2252,14 +2009,13 @@ class TgWsCore:
                 except:
                     pass
                 self._untrack(ws)
-                ws_from_pool = False
                 ws, _, _, ws_timed_out = self._connect_ws((target_ip, dst_ip), domains, dc_key, timeout=ws_timeout, path=ws_path)
                 if ws is None:
                     if ws_timed_out:
-                        self._ip_fail_record(target_ip)
+                        self.ip_fail_until[target_ip] = time.monotonic() + float(TGWS_IP_FAIL_COOLDOWN_SEC)
                     self._fallback(conn, dst, port, init_packet, dc, is_media, proto_int, allow_cf=not priority_cf_tried, streams=streams, is_test_dc=is_test_dc)
                     return
-                self._ip_fail_clear(target_ip)
+                self.ip_fail_until.pop(target_ip, None)
                 self.ws_pool.report_success((int(dc), bool(is_media), str(target_ip)))
                 self._track(ws)
                 try:
@@ -2278,18 +2034,17 @@ class TgWsCore:
             except Exception:
                 splitter = None
             healthy = self._bridge_ws_split(conn, ws, splitter, streams=streams)
-            if healthy:
-                self._last_ok_ts = time.monotonic()
-            elif not ws_from_pool:
-                # A pooled connection that ends without a byte is usually just stale (the
-                # server closed it while it sat idle), not evidence that this DC is down.
+            if not healthy:
                 self._ws_fail_record(dc_key)
                 self.ws_domain_pref.pop(dc_key, None)
             return
         except:
             pass
         finally:
-            _tgws_hard_close(conn)
+            try:
+                conn.close()
+            except:
+                pass
             self._untrack(conn)
 
 __all__ = [name for name in globals() if not name.startswith("__")]

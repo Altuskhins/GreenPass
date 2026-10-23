@@ -640,41 +640,6 @@ def _sanitize_proxy_uri(raw_uri):
     return text
 
 
-def _ss_split_userinfo(user_part):
-    """Return (method, password) from SIP002 userinfo, or None.
-
-    Accepts plain-text ``method:password`` (optionally percent-encoded, as used by
-    SS-2022 whose keys are base64 and contain + / =) and base64 ``method:password``.
-    """
-    try:
-        raw = urllib.parse.unquote(str(user_part or "")).strip()
-    except:
-        return None
-    if not raw:
-        return None
-    if ":" in raw:
-        method, password = raw.split(":", 1)
-        method = method.strip()
-        if not method:
-            return None
-        return method, password
-    try:
-        blob = raw.replace("-", "+").replace("_", "/")
-        miss = len(blob) % 4
-        if miss:
-            blob += "=" * (4 - miss)
-        decoded = base64.b64decode(blob, validate=True).decode("utf-8", errors="ignore")
-    except:
-        return None
-    if ":" not in decoded:
-        return None
-    method, password = decoded.split(":", 1)
-    method = method.strip()
-    if not method:
-        return None
-    return method, urllib.parse.unquote(password)
-
-
 def _proxy_uri_dedup_key(raw_uri):
     uri = _sanitize_proxy_uri(raw_uri)
     if not uri:
@@ -705,7 +670,7 @@ def _proxy_uri_dedup_key(raw_uri):
         try:
             body = uri[5:].split("#", 1)[0].strip()
             if "@" in body:
-                creds, server_part = body.rsplit("@", 1)
+                creds, server_part = body.split("@", 1)
             else:
                 blob = body.split("?", 1)[0].replace("-", "+").replace("_", "/")
                 miss = len(blob) % 4
@@ -731,9 +696,6 @@ def _proxy_uri_dedup_key(raw_uri):
                 host = host.lower().strip()
                 port = str(port or "").strip()
             creds = str(creds or "").strip()
-            pair = _ss_split_userinfo(creds) if "@" in body else None
-            if pair:
-                creds = "%s:%s" % pair
             if creds and host and port:
                 return "ss://%s@%s:%s" % (creds, host, port)
         except:
@@ -841,24 +803,16 @@ def _parse_standard_proxy_uri(uri_str, fallback_name="Узел"):
             rest = host_port[rb + 1:]
             if not rest.startswith(":"):
                 return None
-            port_spec = str(rest[1:] or "0").strip()
+            port = int(str(rest[1:] or "0").strip())
         else:
             if ":" not in host_port:
                 return None
-            host, port_spec = host_port.rsplit(":", 1)
-            port_spec = str(port_spec or "0").strip()
-        hop_spec = ""
-        if re.match(r"^\d+([,-]\d+)+$", port_spec):
-            # port hopping, e.g. 443,20000-30000: first number is the main port
-            hop_spec = port_spec
-            port_spec = re.split(r"[,-]", port_spec, maxsplit=1)[0]
-        port = int(port_spec)
+            host, port_s = host_port.rsplit(":", 1)
+            port = int(str(port_s or "0").strip())
         params = {}
         if params_raw:
             for key, value in urllib.parse.parse_qsl(params_raw, keep_blank_values=True):
                 params[str(key or "")] = str(value or "")
-        if hop_spec and not params.get("mport"):
-            params["mport"] = hop_spec
         if path and "path" not in params:
             params["path"] = path
         host = str(host or "").strip()
@@ -945,16 +899,20 @@ def _parse_ss_uri_details(uri_str):
         port = 0
 
         if "@" in body:
-            user_part, server_part = body.rsplit("@", 1)
+            user_part, server_part = body.split("@", 1)
             server_part = str(server_part or "").split("?", 1)[0].strip().rstrip("/")
-            pair = _ss_split_userinfo(user_part)
-            if not pair or ":" not in server_part:
+            try:
+                user_b64 = str(user_part or "").replace("-", "+").replace("_", "/")
+                miss = len(user_b64) % 4
+                if miss:
+                    user_b64 += "=" * (4 - miss)
+                decoded = base64.b64decode(user_b64, validate=False).decode("utf-8", errors="ignore")
+            except:
+                decoded = urllib.parse.unquote(str(user_part or ""))
+            if ":" not in decoded or ":" not in server_part:
                 return None
-            method, password = pair
+            method, password = decoded.split(":", 1)
             host, port_str = server_part.rsplit(":", 1)
-            host = host.strip()
-            if host.startswith("[") and host.endswith("]"):
-                host = host[1:-1]
             port = int(str(port_str or "").strip())
         else:
             try:
@@ -971,12 +929,11 @@ def _parse_ss_uri_details(uri_str):
             if ":" not in user_part or ":" not in server_part:
                 return None
             method, password = user_part.split(":", 1)
-            password = urllib.parse.unquote(password)
             host, port_str = server_part.rsplit(":", 1)
             port = int(str(port_str or "").strip())
 
         method = str(method or "").strip()
-        password = str(password or "")
+        password = urllib.parse.unquote(str(password or ""))
         host = str(host or "").strip()
         if not method or not host or int(port or 0) <= 0:
             return None
@@ -1847,7 +1804,8 @@ def _build_singbox_awg_config(conf_text, local_port):
         if psk:
             item["pre_shared_key"] = psk
         keepalive = str(peer.get("persistentkeepalive", "") or "").strip()
-        item["persistent_keepalive_interval"] = int(keepalive) if keepalive else 25
+        if keepalive:
+            item["persistent_keepalive_interval"] = int(keepalive)
         sb_peers.append(item)
 
     endpoint = {
@@ -1869,9 +1827,6 @@ def _build_singbox_awg_config(conf_text, local_port):
     config = _sb_base_config(local_port)
     config["endpoints"] = [endpoint]
     config["route"]["final"] = "awg-out"
-    if not any(":" in str(item).split("/", 1)[0] for item in addresses):
-        # The tunnel has no IPv6 address: fail IPv6 destinations fast instead of timing out.
-        config["route"]["rules"].append({"ip_version": 6, "action": "reject"})
     dns = [item.strip() for item in str(interface.get("dns", "") or "").split(",") if item.strip()]
     if dns:
         config["dns"] = {"servers": [{"type": "udp", "tag": "awg-dns", "server": dns[0]}]}
@@ -1879,51 +1834,13 @@ def _build_singbox_awg_config(conf_text, local_port):
     return json.dumps(config)
 
 
-_SB_UTLS_FINGERPRINTS = (
-    "chrome", "firefox", "edge", "safari", "360", "qq", "ios", "android", "random", "randomized",
-)
-
-
-def _sb_normalize_fp(value):
-    fp = str(value or "").strip().lower()
-    return fp if fp in _SB_UTLS_FINGERPRINTS else "chrome"
-
-
-def _sb_reality_params_valid(params):
-    """Reality needs a 32-byte base64url public key and an even-length hex short id (<= 16)."""
-    try:
-        pbk = str((params or {}).get("pbk", "") or "").strip()
-        sid = str((params or {}).get("sid", "") or "").strip()
-        if not pbk:
-            return False
-        if len(base64.urlsafe_b64decode(pbk + "=" * (-len(pbk) % 4))) != 32:
-            return False
-        if len(sid) % 2 != 0 or not re.fullmatch(r"[0-9a-fA-F]{0,16}", sid):
-            return False
-        return True
-    except Exception:
-        return False
-
-
-def _sb_normalize_vless_flow(flow):
-    """Return the flow sing-box accepts, or None when the node must be dropped."""
-    flow = str(flow or "").strip()
-    if not flow:
-        return ""
-    if flow.lower().startswith("xtls-rprx-vision"):
-        return "xtls-rprx-vision"
-    return None
-
-
 def _sb_tls(params, server=""):
     security = str((params or {}).get("security", "none") or "none").lower()
     if security == "none":
         return None
-    if security == "reality" and not _sb_reality_params_valid(params):
-        # Callers treat an exception as "node cannot be built"; the node is skipped
-        # instead of making the core reject the whole (balanced) config.
-        raise ValueError("invalid reality parameters")
-    fp = _sb_normalize_fp((params or {}).get("fp", "chrome"))
+    fp = str((params or {}).get("fp", "chrome") or "chrome")
+    if not fp:
+        fp = "chrome"
     tls = {
         "enabled": True,
         "server_name": str((params or {}).get("sni", "") or server or ""),
@@ -2046,54 +1963,6 @@ def _sb_ensure_tls_for_transport(tls, tr, params, server=""):
     }
 
 
-def _ss_plugin_from_params(params):
-    """Return (plugin, plugin_opts) for sing-box, ("", "") when absent, or
-    None when the plugin cannot be honoured."""
-    raw = str((params or {}).get("plugin", "") or "").strip()
-    if not raw:
-        return "", ""
-    name, _, opts = raw.partition(";")
-    name = name.strip().lower()
-    opts = opts.strip()
-    if name in ("obfs-local", "simple-obfs", "obfs"):
-        return "obfs-local", opts
-    if name == "v2ray-plugin":
-        return "v2ray-plugin", opts
-    return None
-
-
-def _sb_server_ports(main_port, spec):
-    """Convert a port-hopping spec ('443,20000-30000') to sing-box server_ports."""
-    ports = []
-    try:
-        main_port = int(main_port or 0)
-    except:
-        main_port = 0
-    items = []
-    if main_port > 0:
-        items.append("%d:%d" % (main_port, main_port))
-    for part in re.split(r"[,;]", str(spec or "")):
-        part = part.strip()
-        if not part:
-            continue
-        m = re.match(r"^(\d+)\s*[-:]\s*(\d+)$", part)
-        if m:
-            lo, hi = int(m.group(1)), int(m.group(2))
-        elif part.isdigit():
-            lo = hi = int(part)
-        else:
-            continue
-        if lo > hi:
-            lo, hi = hi, lo
-        if lo < 1 or hi > 65535:
-            continue
-        items.append("%d:%d" % (lo, hi))
-    for item in items:
-        if item not in ports:
-            ports.append(item)
-    return ports if len(ports) > 1 else []
-
-
 def _build_singbox_config(uri_str, local_port, socks_username="", socks_password=""):
     if _is_sudoku_uri(uri_str):
         details = _parse_sudoku_uri_details(uri_str)
@@ -2190,14 +2059,6 @@ def _build_singbox_config(uri_str, local_port, socks_username="", socks_password
                 "method": str(details.get("method", "") or ""),
                 "password": str(details.get("password", "") or ""),
             }]
-            plugin = _ss_plugin_from_params(details.get("params", {}))
-            if plugin is None:
-                return None, None
-            plugin_name, plugin_opts = plugin
-            if plugin_name:
-                cfg["outbounds"][0]["plugin"] = plugin_name
-                if plugin_opts:
-                    cfg["outbounds"][0]["plugin_opts"] = plugin_opts
             return json.dumps(cfg), str(details.get("name", "SS узел") or "SS узел")
         except:
             return None, None
@@ -2277,13 +2138,6 @@ def _build_singbox_config(uri_str, local_port, socks_username="", socks_password
             obfps = str(params.get("fp", "") or "")
             if obfps:
                 ob["tls"]["utls"] = {"enabled": True, "fingerprint": obfps}
-            hop_ports = _sb_server_ports(ob.get("server_port", 0), params.get("mport", params.get("ports", "")))
-            if hop_ports:
-                ob.pop("server_port", None)
-                ob["server_ports"] = hop_ports
-                hop_interval = str(params.get("hop-interval", params.get("hop_interval", "")) or "").strip()
-                if hop_interval.isdigit() and int(hop_interval) > 0:
-                    ob["hop_interval"] = hop_interval + "s"
             obfs_type = str(params.get("obfs", "") or "").strip()
             obfs_password = str(params.get("obfs-password", params.get("obfs_password", "")) or "")
             if obfs_type:
@@ -2492,16 +2346,13 @@ def _build_singbox_config(uri_str, local_port, socks_username="", socks_password
     try:
         params = dict(details.get("params", {}) or {})
         cfg = _sb_base_config(local_port, socks_username, socks_password)
-        flow = _sb_normalize_vless_flow(params.get("flow", ""))
-        if flow is None:
-            return None, None
         ob = {
             "type": "vless",
             "tag": "proxy",
             "server": str(details.get("server", "") or ""),
             "server_port": int(details.get("port", 0) or 0),
             "uuid": str(details.get("uuid", "") or ""),
-            "flow": flow,
+            "flow": str(params.get("flow", "") or ""),
         }
         pe = str(params.get("packetEncoding", "") or "").strip()
         if pe:
@@ -2530,18 +2381,12 @@ def _build_singbox_balanced_config(nodes, local_port, socks_username="", socks_p
     outbounds = []
     for node in list(nodes or [])[:VLESS_BALANCER_MAX_NODES]:
         try:
-            if isinstance(node, dict) and str(node.get("kind", "") or "").strip().lower() == "singbox-config":
-                file_obs = json.loads(str(node.get("raw_config", "") or "{}")).get("outbounds") or []
-                ob = dict(file_obs[0]) if file_obs and isinstance(file_obs[0], dict) and not file_obs[0].get("detour") else None
-                if not ob:
-                    continue
-            else:
-                uri = str(node.get("uri", "") if isinstance(node, dict) else node or "")
-                raw, _ = _build_registered_proxy_config(uri, local_port, socks_username=socks_username, socks_password=socks_password)
-                if not raw:
-                    continue
-                obs = json.loads(raw).get("outbounds") or []
-                ob = next((o for o in obs if o.get("tag") == "proxy"), None)
+            uri = str(node.get("uri", "") if isinstance(node, dict) else node or "")
+            raw, _ = _build_registered_proxy_config(uri, local_port, socks_username=socks_username, socks_password=socks_password)
+            if not raw:
+                continue
+            obs = json.loads(raw).get("outbounds") or []
+            ob = next((o for o in obs if o.get("tag") == "proxy"), None)
             if not ob:
                 continue
             tag = "sb-route-%d" % (len(outbounds) + 1)
@@ -2757,21 +2602,5 @@ _TGWS_IP_TO_DC = {
     "91.108.56.151": (5, True),
     "91.105.192.100": (203, False),
 }
-
-def _infer_awg_conf_is_free(conf_name, conf_text):
-    """Old installs have no stored flag: the free VPgram download is recognised by its file name
-    (default VPgram_Free.conf) or the generated Cloudflare_WARP.conf, or, with an empty name, by a vpgram Endpoint host."""
-    name = str(conf_name or "").strip().lower()
-    if name:
-        # "Cloudflare_WARP.conf" is the exact name our own WARP generator writes.
-        return "vpgram" in name or name == "cloudflare_warp.conf"
-    if not str(conf_text or "").strip():
-        return False
-    for raw in str(conf_text).splitlines():
-        line = raw.strip()
-        if line.lower().startswith("endpoint") and "=" in line:
-            return "vpgram" in line.split("=", 1)[1].lower()
-    return False
-
 
 __all__ = [name for name in globals() if not name.startswith("__")]

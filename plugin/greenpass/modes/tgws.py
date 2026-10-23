@@ -124,14 +124,7 @@ class TgWsModeMixin:
         return bool(
             self._is_local_tgws_proxy_applied(expected_port)
             and _check_vless_port(expected_port)
-            and self._tgws_accept_thread_alive()
         )
-
-    def _tgws_accept_thread_alive(self):
-        try:
-            return bool(self._tgws_core.is_healthy())
-        except:
-            return True
 
     def _tgws_heal_if_due(self):
         now = time.time()
@@ -150,10 +143,7 @@ class TgWsModeMixin:
 
     def _tgws_local_alive(self):
         try:
-            return bool(
-                self._tgws_running and self._tgws_port and _check_vless_port(self._tgws_port)
-                and self._tgws_accept_thread_alive()
-            )
+            return bool(self._tgws_running and self._tgws_port and _check_vless_port(self._tgws_port))
         except:
             return False
 
@@ -205,14 +195,6 @@ class TgWsModeMixin:
         if not self._should_run_tgws():
             self._tgws_ready = False
             return False
-        if _gp_is_ui_thread():
-            # Picking a port, starting the listener and the HTTP/2 runtime can take
-            # seconds: never on the UI thread.
-            try:
-                threading.Thread(target=self._tgws_connect, daemon=True).start()
-                return True
-            except Exception:
-                pass
         with self._tgws_connect_lock:
             if bool(getattr(self, "_tgws_connecting", False)):
                 return False
@@ -381,37 +363,22 @@ class TgWsModeMixin:
     def _tgws_disconnect_with_reason(self, reason, silent=False):
         self._tgws_disconnect(silent=bool(silent))
 
-    def _tgws_stop_core(self):
-        """Stop the TG-WS server. On the UI thread only the non-blocking half runs there
-        (listener and live bridges are closed); the joins and the HTTP/2 runtime teardown
-        finish on a daemon thread, and are skipped if a newer start() superseded them."""
-        core = self._tgws_core
-        if _gp_is_ui_thread():
-            try:
-                token = core.request_stop()
-                threading.Thread(target=lambda: core.finish_stop(token), daemon=True).start()
-                return
-            except Exception:
-                pass
-        try:
-            core.stop()
-        except:
-            pass
-
     def _tgws_disconnect(self, silent=False):
         old_port = int(self._tgws_port or 0)
         try:
             self._tgws_generation = int(getattr(self, "_tgws_generation", 0) or 0) + 1
         except:
             self._tgws_generation = 1
+        try:
+            self._tgws_core.stop()
+        except:
+            pass
         self._tgws_running = False
         self._tgws_ready = False
         self._tgws_port = 0
         self._tgws_connecting = False
-        # Telegram's proxy first, then the server: Telegram never dials a dead port.
         if old_port > 0:
             self._clear_local_socks_proxy_if_port(old_port, owner=TGWS_KIND)
-        self._tgws_stop_core()
         if not silent:
             self._refresh_settings_without_reopen(reload_main=True, reload_stack=True)
 

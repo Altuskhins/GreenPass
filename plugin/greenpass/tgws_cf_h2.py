@@ -1155,11 +1155,6 @@ class _Connection:
         except (OSError, H2Error, httpx.HTTPError) as exc:
             error = exc if isinstance(exc, httpx.HTTPError) else httpx.RemoteProtocolError(str(exc))
             self.fail(error)
-        except Exception as exc:
-            # Any other failure (for example one raised by the response_started callback)
-            # must still mark the connection failed: otherwise the transport keeps reusing
-            # a connection whose reader is gone and every request waits for its timeout.
-            self.fail(httpx.RemoteProtocolError('H2 reader failed: %r' % (exc,)))
 
     def check_error(self):
         if self.error is not None:

@@ -1,33 +1,16 @@
 import base64
 import re
-import threading
 import zlib
 
 from base_plugin import BasePlugin, MethodHook
 from java import jclass
 from org.telegram.messenger import ApplicationLoader
-from .foundation import _set_native_proxy_settings, _set_tg_proxy_enabled
+from .foundation import _set_native_proxy_settings
 from .webproxy_payload import DEX_PAYLOAD_ZLIB_B64
 
 
 def raw_class(name):
-    # forName raises ClassNotFoundException on clients without the class; callers
-    # expect None ("class absent") rather than an exception.
-    try:
-        return jclass("java.lang.Class").forName(name)
-    except Exception:
-        return None
-
-
-def _client_supports_webproxy():
-    try:
-        version = str(jclass("org.telegram.messenger.BuildVars").BUILD_VERSION_STRING)
-        parts = [int(x) for x in re.findall(r"\d+", version)[:3]]
-        while len(parts) < 3:
-            parts.append(0)
-        return tuple(parts) >= (12, 9, 0)
-    except Exception:
-        return True
+    return jclass("java.lang.Class").forName(name)
 
 
 CharSequence = jclass("java.lang.CharSequence")
@@ -160,28 +143,17 @@ class ProxyIntentHook(MethodHook):
             local = self.plugin.start_adapter(server_full, secret)
         except Exception as error:
             self.plugin.log("WEB proxy link failed: %s" % error)
-            try:
-                param.setResult(True)
-            except Exception:
-                pass
+            param.setResult(True)
             return
-        # Anything below must never propagate into AndroidUtilities.handleProxyIntent:
-        # on failure the intent is left as it was and Telegram handles the link itself.
-        try:
-            port, local_secret = local
-            Uri = jclass("android.net.Uri")
-            intent.setData(Uri.parse(
-                "tg://proxy?server=127.0.0.1&port=%d&secret=dd%s" % (port, local_secret)
-            ))
-            self.plugin.dex.invoke(
-                "upsertEntry", ApplicationLoader.applicationContext, server_full, secret)
-            self.plugin.pending_display = (server, port, local_secret, secret, server_port)
-            self.plugin._pending_rows = 0
-        except Exception as error:
-            try:
-                self.plugin.log("WEB proxy intent rewrite failed: %s" % error)
-            except Exception:
-                pass
+        port, local_secret = local
+        Uri = jclass("android.net.Uri")
+        intent.setData(Uri.parse(
+            "tg://proxy?server=127.0.0.1&port=%d&secret=dd%s" % (port, local_secret)
+        ))
+        self.plugin.dex.invoke(
+            "upsertEntry", ApplicationLoader.applicationContext, server_full, secret)
+        self.plugin.pending_display = (server, port, local_secret, secret, server_port)
+        self.plugin._pending_rows = 0
 
 
 class SettingsCreateViewHook(MethodHook):
@@ -381,10 +353,7 @@ class SheetRowHook(MethodHook):
 class CountryHook(MethodHook):
     def __init__(self, plugin):
         self.plugin = plugin
-        # Overlapping requestProxyCountry calls must not share one slot: a lost
-        # stash would leave a persisted ProxyInfo.address as the relay domain.
-        self._restores = {}
-        self._restores_lock = threading.Lock()
+        self._restore = None
 
     def before_hooked_method(self, param):
         try:
@@ -407,25 +376,14 @@ class CountryHook(MethodHook):
             # the relay domain on the local adapter port forever ("connected once, then
             # connects never again", invisible to restore/migrate which require 127.0.0.1).
             field = info.getClass().getField('address')
-            stash = (info, field, str(field.get(info)))
-            with self._restores_lock:
-                self._restores[id(param)] = stash
-            try:
-                field.set(info, server)
-            except Exception:
-                with self._restores_lock:
-                    self._restores.pop(id(param), None)
-                try:
-                    field.set(info, stash[2])
-                except Exception:
-                    pass
+            self._restore = (info, field, str(field.get(info)))
+            field.set(info, server)
         except Exception:
-            with self._restores_lock:
-                self._restores.pop(id(param), None)
+            self._restore = None
 
     def after_hooked_method(self, param):
-        with self._restores_lock:
-            stash = self._restores.pop(id(param), None)
+        stash = self._restore
+        self._restore = None
         if not stash:
             return
         try:
@@ -531,19 +489,8 @@ class WebProxyNativePlugin(BasePlugin):
         self._pending_rows += 1
 
     def on_plugin_load(self):
-        if not _client_supports_webproxy():
-            self.log("WEB proxy needs client >= 12.9.0, skipped")
-            return
         self.dex.load()
-        try:
-            self.install_hooks()
-        except Exception:
-            # Roll back a partial load (DEX loaded, some hooks installed) before failing.
-            try:
-                self.on_plugin_unload()
-            except Exception:
-                pass
-            raise
+        self.install_hooks()
         try:
             restored = int(self.dex.invoke(
                 "restoreEntries", ApplicationLoader.applicationContext))
@@ -574,16 +521,8 @@ class WebProxyNativePlugin(BasePlugin):
         except Exception:
             pass
         if ours_active:
-            # Prefs + native: Telegram persists the active proxy, so a native-only
-            # disable would leave a dead loopback adapter selected for the next start.
-            try:
-                _set_tg_proxy_enabled(False)
-            except Exception:
-                self.apply_native(False, 0, "")
-        try:
-            self.dex.unload()
-        except Exception:
-            pass
+            self.apply_native(False, 0, "")
+        self.dex.unload()
 
     def install_hooks(self):
         # One getDeclaredMethods() pass per class: every getName() is a JNI

@@ -323,33 +323,13 @@ class OlcRtcModeMixin:
             return
         if self._go_core_switch_blocked("olcrtc"):
             return
-
-        def _prepare_and_run():
-            # dlopen of the ~120 MB library and downloads run on this worker thread,
-            # never on the caller's (possibly UI) thread.
-            try:
-                self._prepare_olcrtc_core_and_run(runner, runner_name, require_olcrtc_mode, show_feedback)
-            except Exception as exc:
-                err_text = str(exc)
-                self._set_olcrtc_last_error(err_text, event="ensure_runner_exception", runner=runner_name)
-
-        try:
-            threading.Thread(target=_prepare_and_run, daemon=True).start()
-        except Exception:
-            pass
-
-    def _prepare_olcrtc_core_and_run(self, runner, runner_name, require_olcrtc_mode, show_feedback):
-        if self._libsingbox_core_load_allowed():
-            self._olcrtc_core._ensure()
+        self._olcrtc_core._ensure()
         if self._olcrtc_core.is_available():
             if require_olcrtc_mode and (not self._should_run_olcrtc()):
                 if show_feedback and self._is_olcrtc_mode_selected():
                     run_on_ui_thread(lambda: BulletinHelper.show_error(self._olcrtc_config_error() or "olcRTC выключен"))
                 return
-            runner()
-            return
-        if self._core_needs_restart_notice():
-            BulletinHelper.show_info("Ядро обновлено — перезапустите приложение")
+            threading.Thread(target=runner, daemon=True).start()
             return
         if self._olcrtc_prepare_in_progress:
             if show_feedback:
@@ -359,31 +339,35 @@ class OlcRtcModeMixin:
         self._olcrtc_prepare_in_progress = True
         if show_feedback:
             BulletinHelper.show_info("Готовлю olcRTC...")
-        try:
-            ok = self._install_libzvonki_bundle(allow_network=True)
-            if ok and self._core_restart_required():
-                BulletinHelper.show_success("Ядро установлено — перезапустите приложение")
-                return
-            self._reload_olcrtc_core()
-            self._olcrtc_core._ensure()
-            if ok and self._olcrtc_core.is_available():
-                if require_olcrtc_mode and (not self._should_run_olcrtc()):
+
+        def _worker():
+            try:
+                ok = self._install_libzvonki_bundle(allow_network=True)
+                if ok and self._core_restart_required():
+                    run_on_ui_thread(lambda: BulletinHelper.show_success("Ядро установлено — перезапустите приложение"))
                     return
-                if show_feedback and not bool(getattr(self, "_olcrtc_backgrounded", False)):
-                    BulletinHelper.show_success("Ядро olcRTC готово")
-                try:
-                    runner()
-                except Exception as exc:
-                    err_text = str(exc)
-                    self._set_olcrtc_last_error(err_text, event="ensure_runner_exception", runner=runner_name)
+                self._reload_olcrtc_core()
+                self._olcrtc_core._ensure()
+                if ok and self._olcrtc_core.is_available():
+                    if require_olcrtc_mode and (not self._should_run_olcrtc()):
+                        return
                     if show_feedback and not bool(getattr(self, "_olcrtc_backgrounded", False)):
-                        BulletinHelper.show_error("Ошибка olcRTC: %s" % err_text)
-            else:
-                self._set_olcrtc_last_error("core prepare failed", event="ensure_prepare_failed", runner=runner_name, installed=ok)
-                if show_feedback and not bool(getattr(self, "_olcrtc_backgrounded", False)):
-                    BulletinHelper.show_error("Не удалось загрузить olcRTC")
-        finally:
-            self._olcrtc_prepare_in_progress = False
+                        run_on_ui_thread(lambda: BulletinHelper.show_success("Ядро olcRTC готово"))
+                    try:
+                        runner()
+                    except Exception as exc:
+                        err_text = str(exc)
+                        self._set_olcrtc_last_error(err_text, event="ensure_runner_exception", runner=runner_name)
+                        if show_feedback and not bool(getattr(self, "_olcrtc_backgrounded", False)):
+                            run_on_ui_thread(lambda err_text=err_text: BulletinHelper.show_error("Ошибка olcRTC: %s" % err_text))
+                else:
+                    self._set_olcrtc_last_error("core prepare failed", event="ensure_prepare_failed", runner=runner_name, installed=ok)
+                    if show_feedback and not bool(getattr(self, "_olcrtc_backgrounded", False)):
+                        run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось загрузить olcRTC"))
+            finally:
+                self._olcrtc_prepare_in_progress = False
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _olcrtc_connect(self):
         with self._olcrtc_connect_lock:
@@ -552,21 +536,20 @@ class OlcRtcModeMixin:
         self._olcrtc_disconnect(silent=bool(silent), stop_core=bool(stop_core))
 
     def _olcrtc_disconnect(self, silent=False, stop_core=False):
-        stop_generation = self._next_olcrtc_generation()
+        self._next_olcrtc_generation()
         self._olcrtc_feedback_requested = False
         old_port = int(self._olcrtc_port or 0)
         with self._olcrtc_connect_lock:
             self._olcrtc_connect_pending = False
+        if bool(stop_core):
+            self._stop_olcrtc_core_async()
         self._olcrtc_running = False
         self._olcrtc_connecting = False
         self._olcrtc_dead_checks = 0
         self._olcrtc_port = 0
         self._set_olcrtc_last_log("stopped", event="disconnect_finish", old_port=old_port)
-        # Telegram's proxy first, then the core: Telegram never dials a dead port.
         if old_port > 0:
             self._clear_local_socks_proxy_if_port(old_port, owner=OLCRTC_KIND)
-        if bool(stop_core):
-            self._stop_olcrtc_core_async(stop_generation)
         if not silent:
             self._refresh_settings_without_reopen(reload_main=True, reload_stack=True)
 
@@ -604,7 +587,6 @@ class OlcRtcModeMixin:
     def _switch_to_olcrtc_mode(self, persist_mode=True):
         if self._go_core_switch_blocked("olcrtc"):
             return
-        self._native_start_guard_release()
         if persist_mode:
             self._set_connection_mode(OLCRTC_KIND)
         self._vless_disconnect_with_reason("switch_to_olcrtc_mode", silent=True)

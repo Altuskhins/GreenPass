@@ -199,79 +199,34 @@ class _DialogsShowDoneItemForceProxyHook(MethodHook):
 
 
 class _ProxySettingsChangedNotifyHook(MethodHook):
-    """Runs for EVERY NotificationCenter post (hundreds per second while media loads),
-    so it must stay cheap: the two event ids are resolved once, everything else
-    returns at the first comparison, and background work is coalesced into one
-    worker per kind instead of one thread per event."""
-
     def __init__(self, plugin):
         self._plugin = plugin
-        self._network_changed_id = None
-        self._proxy_changed_id = None
-        self._busy = {}
-        self._busy_lock = threading.Lock()
-
-    def _resolve_ids(self):
-        try:
-            self._network_changed_id = int(getattr(NotificationCenter, "didUpdateConnectionState"))
-        except:
-            self._network_changed_id = -1
-        try:
-            self._proxy_changed_id = int(NotificationCenter.proxySettingsChanged)
-        except:
-            self._proxy_changed_id = -1
-
-    def _run_coalesced(self, key, fn):
-        # One in-flight worker per key; events that arrive meanwhile schedule exactly
-        # one more run after it.
-        with self._busy_lock:
-            state = self._busy.get(key)
-            if state is not None:
-                state["dirty"] = True
-                return
-            state = {"dirty": False}
-            self._busy[key] = state
-
-        def _loop():
-            try:
-                while True:
-                    try:
-                        fn()
-                    except:
-                        pass
-                    with self._busy_lock:
-                        if not state["dirty"]:
-                            self._busy.pop(key, None)
-                            return
-                        state["dirty"] = False
-            except:
-                with self._busy_lock:
-                    self._busy.pop(key, None)
-
-        try:
-            threading.Thread(target=_loop, daemon=True).start()
-        except:
-            with self._busy_lock:
-                self._busy.pop(key, None)
 
     def after_hooked_method(self, param):
         try:
-            if self._proxy_changed_id is None:
-                self._resolve_ids()
-            args = param.args
-            if not args:
-                return
-            try:
-                event_id = int(args[0])
-            except:
-                return
-            if event_id != self._network_changed_id and event_id != self._proxy_changed_id:
-                return
             if not self._plugin._active:
                 return
+            if not param.args or len(param.args) < 1:
+                return
 
-            if event_id == self._network_changed_id:
-                self._run_coalesced("vpn_policy", self._plugin._apply_vpn_policy)
+            try:
+                event_id = int(param.args[0])
+            except:
+                return
+
+            try:
+                network_changed_id = int(getattr(NotificationCenter, "didUpdateConnectionState"))
+            except:
+                network_changed_id = -1
+            if event_id == network_changed_id:
+                threading.Thread(target=self._plugin._apply_vpn_policy, daemon=True).start()
+
+            try:
+                proxy_changed_id = int(NotificationCenter.proxySettingsChanged)
+            except:
+                return
+
+            if event_id != proxy_changed_id:
                 return
 
             if (
@@ -280,7 +235,7 @@ class _ProxySettingsChangedNotifyHook(MethodHook):
                 and not self._plugin._is_proxy_policy_suspended()
                 and not _is_tg_proxy_enabled()
             ):
-                self._run_coalesced("restore_vless", self._plugin._restore_running_vless_proxy)
+                threading.Thread(target=self._plugin._restore_running_vless_proxy, daemon=True).start()
             else:
                 self._plugin._refresh_settings_without_reopen()
             self._plugin._refresh_current_dialogs_proxy_button()
@@ -401,8 +356,7 @@ class _VoipRelayLinkIntentHook(MethodHook):
             uri = str(intent.getData() or "")
             if not uri.lower().startswith("tg://relay?"):
                 return
-            # handleIntent returns boolean: a null result would NPE inside LaunchActivity.
-            param.setResult(True)
+            param.setResult(None)
             run_on_ui_thread(lambda: self._plugin._handle_import_uri(uri))
         except:
             pass
@@ -519,14 +473,13 @@ class _WebRtcJoinResponseRewriteHook(MethodHook):
         except:
             pass
 
-
 class _Ipv6PolicyHook(MethodHook):
     def __init__(self, plugin):
         self._plugin = plugin
 
     def after_hooked_method(self, param):
         try:
-            if self._plugin._active and self._plugin._should_force_ipv4():
+            if self._plugin._active and not self._plugin._ipv6_enabled():
                 self._plugin._force_ipv4_strategy()
         except:
             pass

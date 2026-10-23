@@ -243,8 +243,7 @@ class SettingsUiMixin:
         if activity is None:
             BulletinHelper.show_info("Доступно обновление GreenPass %s" % str(version))
             return False
-        # Not marked as "prompted" yet: only an actual install attempt does that,
-        # "Later" just snoozes for a day, so a failed/cancelled dialog never hides the release.
+        self._set_setting_value("plugin_autoupdate_prompted_version", str(version or ""), reload_settings=False)
         builder = AlertDialogBuilder(activity)
         builder.set_title("Доступно обновление")
         builder.set_message("GreenPass %s готов к установке." % str(version))
@@ -254,24 +253,10 @@ class SettingsUiMixin:
                 dlg.dismiss()
             except:
                 pass
-            if self._open_elyx_update_archive(archive_path):
-                try:
-                    self._set_setting_value("plugin_autoupdate_prompted_version", str(version or ""), reload_settings=False)
-                except:
-                    pass
-
-        def _later(dlg, which):
-            try:
-                dlg.dismiss()
-            except:
-                pass
-            try:
-                self._set_setting_value("plugin_autoupdate_snooze_until", int(time.time()) + 24 * 3600, reload_settings=False)
-            except:
-                pass
+            self._open_elyx_update_archive(archive_path)
 
         builder.set_positive_button("Установить", _install)
-        builder.set_negative_button("Позже", _later)
+        builder.set_negative_button("Позже", lambda dlg, which: dlg.dismiss())
         builder.show()
         return True
 
@@ -295,16 +280,6 @@ class SettingsUiMixin:
         return True
 
     def _check_core_update_now(self):
-        # The integrity check may hash the 126 MB library: never on the UI thread.
-        if _gp_is_ui_thread():
-            try:
-                threading.Thread(target=self._check_core_update_now_impl, daemon=True).start()
-                return True
-            except Exception:
-                pass
-        return self._check_core_update_now_impl()
-
-    def _check_core_update_now_impl(self):
         if self._vless_prepare_in_progress:
             BulletinHelper.show_info("Ядро уже загружается")
             return True
@@ -1024,9 +999,9 @@ class SettingsUiMixin:
                 on_change=self._on_olcrtc_carrier_changed,
             ),
             Selector(
-                key="olcrtc_transport_ui",
+                key="olcrtc_transport",
                 text="Транспорт",
-                default=self._sync_selector_index_setting("olcrtc_transport_ui", self._olcrtc_transport_choice_index()),
+                default=self._olcrtc_transport_choice_index(),
                 items=[self._olcrtc_transport_label(value) for value in transport_choices],
                 icon="msg_list",
                 on_change=self._on_olcrtc_transport_changed,
@@ -1871,21 +1846,6 @@ class SettingsUiMixin:
         except:
             return 20
 
-    def _sync_selector_index_setting(self, key, index):
-        # Selector keys hold only a list index; the real values live under their own keys.
-        # Rewriting the index before each build keeps a stale/out-of-range index from
-        # ever reaching the host's Selector.
-        try:
-            index = int(index)
-        except:
-            index = 0
-        try:
-            if self.get_setting(key, None) != index:
-                self._set_setting_value(key, index, reload_settings=False)
-        except:
-            pass
-        return index
-
     def _vless_browser_page_size_index(self):
         values = (10, 20, 40, 60)
         value = self._vless_browser_page_size_value()
@@ -2223,9 +2183,9 @@ class SettingsUiMixin:
                     create_sub_fragment=self._create_vless_sources_subpage,
                 ))
             items.append(Selector(
-                key="vless_browser_page_size_idx",
+                key="vless_browser_page_size",
                 text="Серверов на странице",
-                default=self._sync_selector_index_setting("vless_browser_page_size_idx", self._vless_browser_page_size_index()),
+                default=self._vless_browser_page_size_index(),
                 items=["10", "20", "40", "60"],
                 icon="msg_list",
                 on_change=self._on_vless_browser_page_size_changed,
@@ -2767,9 +2727,9 @@ class SettingsUiMixin:
                 on_change=self._on_vless_browser_failover_changed,
             ))
             items.append(Selector(
-                key="vless_auto_check_idx",
+                key="vless_auto_check_minutes",
                 text="Автопроверка пинга",
-                default=self._sync_selector_index_setting("vless_auto_check_idx", self._vless_browser_auto_check_index()),
+                default=self._vless_browser_auto_check_index(),
                 items=["Выключена", "5 минут", "15 минут", "30 минут", "60 минут"],
                 icon="msg_speed",
                 on_change=self._on_vless_browser_auto_check_changed,
@@ -2891,29 +2851,9 @@ class SettingsUiMixin:
             Header(text="Конфигурация"),
             Text(
                 text="Получить AWG конфиг",
-                subtext="Загрузить бесплатную конфигурацию",
+                subtext="Сгенерировать бесплатный Cloudflare WARP",
                 icon="msg_download",
                 on_click=lambda *a: self._download_free_awg_config(),
-            ),
-            Text(
-                text="Обновить бесплатный конфиг",
-                subtext="Скачать новый конфиг AWG",
-                icon="msg_retry",
-                on_click=lambda *a: self._refresh_free_awg_config_from_settings(),
-            ),
-            Selector(
-                key="awg_free_source_idx",
-                text="Бесплатный конфиг",
-                default=self._sync_selector_index_setting("awg_free_source_idx", self._awg_free_source_index()),
-                items=["Cloudflare WARP", "VPgram"],
-                icon="msg_list",
-                on_change=self._on_awg_free_source_changed,
-            ),
-            Text(
-                text="Сгенерировать новый WARP",
-                subtext="Новая регистрация Cloudflare WARP",
-                icon="msg_retry",
-                on_click=lambda *a: self._refresh_free_awg_config_from_settings(source="warp"),
             ),
             Text(
                 text="Выбрать .conf",
