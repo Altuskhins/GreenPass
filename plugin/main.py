@@ -1087,10 +1087,10 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         except:
             return b"", ""
 
-    def _save_elyx_update_archive(self, raw):
+    def _save_elyx_update_archive(self, raw, file_name="GreenPass-update.elyx"):
         try:
             cache_dir = str(ApplicationLoader.applicationContext.getCacheDir().getAbsolutePath())
-            path = os.path.join(cache_dir, "GreenPass-update.elyx")
+            path = os.path.join(cache_dir, file_name)
             temp_path = path + ".tmp"
             with open(temp_path, "wb") as handle:
                 handle.write(bytes(raw or b""))
@@ -1184,13 +1184,15 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 return False
             if (not self._active) and (not force):
                 return False
-            if not self._write_updated_plugin_source(remote_text):
+            # Never overwrite the installed plugin file in place: after a restart the
+            # client could no longer load it ("enabled, but no settings") until the
+            # plugin was reinstalled. Hand the file to exteraGram's own installer.
+            update_path = self._save_elyx_update_archive(remote_text.encode("utf-8"), "GreenPass-update.plugin")
+            if not update_path:
+                if force:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось сохранить обновление GreenPass"))
                 return False
-
-            if (not self._active) and (not force):
-                return False
-            self._set_setting_value("plugin_autoupdate_prompted_version", remote_version, reload_settings=False)
-            run_on_ui_thread(lambda: BulletinHelper.show_info("GreenPass обновлён до %s. Перезапустите приложение." % str(remote_version)))
+            run_on_ui_thread(lambda: self._show_plugin_update_available(remote_version, update_path))
             return True
         except Exception:
             return False
