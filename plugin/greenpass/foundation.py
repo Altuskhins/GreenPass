@@ -2,7 +2,7 @@ __id__ = "GreenPass"
 __name__ = "GreenPass"
 __description__ = "Практически универсальный прокси плагин, поддержка протоколов vless/vmess/hysteria2/etc., встроенные tg-ws-proxy, AmneziaWG и olcrtc, а также полноценнымм проксированием звонков"
 __author__ = "@Altyplugins / Claude"
-__version__ = "2.6.6"
+__version__ = "2.6.3"
 __icon__ = "bratpass/0"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.5.3"
@@ -656,6 +656,22 @@ _LAST_VLESS_FETCH_DIAG = {}
 
 PROXY_TRANSITION_KILLSWITCH_RESUME_DELAY_SEC = 0.12
 PROXY_TRANSITION_KILLSWITCH_FAILSAFE_SEC = 2.5
+# Updates are ordered by this build id, not by the shown version (like Telegram
+# Desktop): bump it by one for every release. Releases are tagged v<version>-b<build>.
+GREENPASS_BUILD = 8
+
+
+def _release_build(release_id):
+    """Build id from a release id/tag such as "2.6.3-b8"; 0 when it has none."""
+    match = re.search(r"-b(\d+)$", str(release_id or "").strip())
+    return int(match.group(1)) if match else 0
+
+
+def _extract_declared_build(text):
+    match = re.search(r"(?m)^GREENPASS_BUILD\s*=\s*(\d+)\s*$", str(text or ""))
+    return int(match.group(1)) if match else 0
+
+
 PLUGIN_AUTOUPDATE_CHECK_INTERVAL_SEC = 3 * 60 * 60
 
 

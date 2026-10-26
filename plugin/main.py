@@ -1010,7 +1010,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
             version = tag[1:] if tag[:1].lower() == "v" else tag
             if not version or not isinstance(release.get("assets"), list):
                 return b"", ""
-            if newer_than and not _is_version_newer(version, newer_than):
+            if newer_than is not None and _release_build(version) <= int(newer_than):
                 return b"", version
             if skip_version and version == str(skip_version):
                 return b"", version
@@ -1055,9 +1055,9 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         try:
             source = raw.decode("utf-8", errors="strict")
             source_id = re.search(r'(?m)^__id__\s*=\s*["\']([^"\']+)["\']', source)
-            source_version = _extract_declared_plugin_version(source)
+            source_build = _extract_declared_build(source)
             if (not source_id or str(source_id.group(1) or "").strip() != __id__
-                    or not source_version or source_version != release_version):
+                    or not source_build or source_build != _release_build(release_version)):
                 return "", ""
             return source, release_version
         except:
@@ -1078,10 +1078,13 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 if int(info.file_size or 0) > 64 * 1024:
                     return b"", ""
                 meta = archive.read(info).decode("utf-8", errors="strict")
+                foundation_name = "plugin/greenpass/foundation.py"
+                if foundation_name not in names:
+                    return b"", ""
+                archive_build = _extract_declared_build(archive.read(foundation_name).decode("utf-8", errors="ignore"))
             plugin_id = re.search(r'(?mi)^id\s*:\s*["\']?([^"\'\s]+)', meta)
-            version = re.search(r'(?mi)^version\s*:\s*["\']?([^"\'\s]+)', meta)
-            if (not plugin_id or str(plugin_id.group(1) or "").strip() != __id__ or not version
-                    or str(version.group(1) or "").strip() != release_version):
+            if (not plugin_id or str(plugin_id.group(1) or "").strip() != __id__
+                    or not archive_build or archive_build != _release_build(release_version)):
                 return b"", ""
             return raw, release_version
         except:
@@ -1133,14 +1136,14 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
 
             skip_version = None if force else str(self.get_setting("plugin_autoupdate_prompted_version", "") or "")
             if _is_elyx_runtime():
-                archive_bytes, remote_version = self._fetch_elyx_update_archive(newer_than=__version__, skip_version=skip_version)
+                archive_bytes, remote_version = self._fetch_elyx_update_archive(newer_than=GREENPASS_BUILD, skip_version=skip_version)
                 self._autoupdate_last_seen_version = str(remote_version or "")
                 self._save_config()
                 if not remote_version:
                     if force:
                         run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось проверить обновления GreenPass"))
                     return False
-                if not _is_version_newer(remote_version, __version__):
+                if _release_build(remote_version) <= GREENPASS_BUILD:
                     if force:
                         run_on_ui_thread(lambda: BulletinHelper.show_success("Установлена актуальная версия GreenPass"))
                     return False
@@ -1160,7 +1163,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 run_on_ui_thread(lambda: self._show_plugin_update_available(remote_version, archive_path))
                 return True
 
-            remote_text, remote_version = self._fetch_plugin_update_text(newer_than=__version__, skip_version=skip_version)
+            remote_text, remote_version = self._fetch_plugin_update_text(newer_than=GREENPASS_BUILD, skip_version=skip_version)
             if (not self._active) and (not force):
                 return False
             self._autoupdate_last_seen_version = str(remote_version or "")
@@ -1170,7 +1173,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 if force:
                     run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось проверить обновления GreenPass"))
                 return False
-            if not _is_version_newer(remote_version, __version__):
+            if _release_build(remote_version) <= GREENPASS_BUILD:
                 if force:
                     run_on_ui_thread(lambda: BulletinHelper.show_success("Установлена актуальная версия GreenPass"))
                 return False

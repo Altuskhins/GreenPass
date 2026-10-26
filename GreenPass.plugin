@@ -4,7 +4,7 @@ __id__ = "GreenPass"
 __name__ = "GreenPass"
 __description__ = "Практически универсальный прокси плагин, поддержка протоколов vless/vmess/hysteria2/etc., встроенные tg-ws-proxy, AmneziaWG и olcrtc, а также полноценнымм проксированием звонков"
 __author__ = "@Altyplugins / Claude"
-__version__ = "2.6.6"
+__version__ = "2.6.3"
 __icon__ = "bratpass/0"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.5.3"
@@ -1525,6 +1525,22 @@ _LAST_VLESS_FETCH_DIAG = {}
 
 PROXY_TRANSITION_KILLSWITCH_RESUME_DELAY_SEC = 0.12
 PROXY_TRANSITION_KILLSWITCH_FAILSAFE_SEC = 2.5
+# Updates are ordered by this build id, not by the shown version (like Telegram
+# Desktop): bump it by one for every release. Releases are tagged v<version>-b<build>.
+GREENPASS_BUILD = 8
+
+
+def _release_build(release_id):
+    """Build id from a release id/tag such as "2.6.3-b8"; 0 when it has none."""
+    match = re.search(r"-b(\d+)$", str(release_id or "").strip())
+    return int(match.group(1)) if match else 0
+
+
+def _extract_declared_build(text):
+    match = re.search(r"(?m)^GREENPASS_BUILD\s*=\s*(\d+)\s*$", str(text or ""))
+    return int(match.group(1)) if match else 0
+
+
 PLUGIN_AUTOUPDATE_CHECK_INTERVAL_SEC = 3 * 60 * 60
 
 
@@ -11958,7 +11974,7 @@ class SettingsUiMixin:
             ),
             Text(
                 text="Проверить обновления",
-                subtext="Текущая версия: " + str(getattr(self, "version", "") or "?"),
+                subtext="Текущая версия: %s (сборка %d)" % (str(getattr(self, "version", "") or "?"), GREENPASS_BUILD),
                 icon="msg_download_settings",
                 on_click=lambda *a: self._check_plugin_update_now(),
             ),
@@ -13680,6 +13696,9 @@ WARP_TIMEOUT = 15
 WARP_MAX_RESPONSE = 256 * 1024
 WARP_DEFAULT_ENDPOINT = "engage.cloudflareclient.com:2408"
 WARP_CONF_NAME = "Cloudflare_WARP.conf"
+# UDP ports the WARP edge accepts WireGuard on. DPI often blocks one port but not the
+# others, so every generated config picks one at random.
+WARP_PORTS = (2408, 500, 1701, 4500)
 WARP_DNS = "1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001"
 WARP_MTU = 1280
 # Junk packets only: a plain WireGuard server ignores them. S1/S2/H1-H4 must stay at the
@@ -13885,10 +13904,25 @@ def build_warp_conf(private_key, peer_public_key, endpoint, v4, v6, obfuscation=
     return "\n".join(lines)
 
 
+def _warp_endpoint_with_random_port(endpoint):
+    value = str(endpoint or "").strip()
+    if value.startswith("[") and "]" in value:
+        host = value[: value.index("]") + 1]
+    elif value.count(":") == 1:
+        host = value.split(":", 1)[0]
+    else:
+        host = value
+    if not host:
+        host = WARP_DEFAULT_ENDPOINT.split(":", 1)[0]
+    port = WARP_PORTS[int.from_bytes(os.urandom(2), "big") % len(WARP_PORTS)]
+    return "%s:%d" % (host, port)
+
+
 def generate_warp_conf(timeout=WARP_TIMEOUT):
     """Register and return the finished .conf text."""
     reg = register_warp(timeout)
-    return build_warp_conf(reg["private_key"], reg["public_key"], reg["endpoint"], reg["v4"], reg["v6"])
+    endpoint = _warp_endpoint_with_random_port(reg["endpoint"])
+    return build_warp_conf(reg["private_key"], reg["public_key"], endpoint, reg["v4"], reg["v6"])
 
 
 
@@ -14084,9 +14118,9 @@ class AwgModeMixin:
 
     # ---- AWG health check -------------------------------------------------
     # A free config can die (server gone, key revoked) while the core keeps
-    # running, so Telegram sits on "Соединение..." until a reinstall. Once a
-    # minute, connect to a Telegram DC through the local AWG proxy; after 3
-    # failures in a row, regenerate the WARP config (or restart a user config).
+    # running, so Telegram sits on "Соединение..." until a reinstall. Every
+    # 30 s, connect to a Telegram DC through the local AWG proxy; after 2
+    # failures in a row (at most once per 3 minutes), regenerate the WARP config (or restart a user config).
     _AWG_HEALTH_TARGETS = (("149.154.167.50", 443), ("149.154.175.50", 443))
 
     def _awg_probe_once(self):
@@ -14129,7 +14163,7 @@ class AwgModeMixin:
             fails = 0
             last_fix = 0.0
             while self._active:
-                time.sleep(60)
+                time.sleep(30)
                 if not self._active:
                     break
                 try:
@@ -14145,7 +14179,7 @@ class AwgModeMixin:
                         fails = 0
                         continue
                     fails += 1
-                    if fails < 3 or time.time() - last_fix < 600:
+                    if fails < 2 or time.time() - last_fix < 180:
                         continue
                     fails = 0
                     last_fix = time.time()
@@ -16132,7 +16166,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
             version = tag[1:] if tag[:1].lower() == "v" else tag
             if not version or not isinstance(release.get("assets"), list):
                 return b"", ""
-            if newer_than and not _is_version_newer(version, newer_than):
+            if newer_than is not None and _release_build(version) <= int(newer_than):
                 return b"", version
             if skip_version and version == str(skip_version):
                 return b"", version
@@ -16177,9 +16211,9 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         try:
             source = raw.decode("utf-8", errors="strict")
             source_id = re.search(r'(?m)^__id__\s*=\s*["\']([^"\']+)["\']', source)
-            source_version = _extract_declared_plugin_version(source)
+            source_build = _extract_declared_build(source)
             if (not source_id or str(source_id.group(1) or "").strip() != __id__
-                    or not source_version or source_version != release_version):
+                    or not source_build or source_build != _release_build(release_version)):
                 return "", ""
             return source, release_version
         except:
@@ -16200,10 +16234,13 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 if int(info.file_size or 0) > 64 * 1024:
                     return b"", ""
                 meta = archive.read(info).decode("utf-8", errors="strict")
+                foundation_name = "plugin/greenpass/foundation.py"
+                if foundation_name not in names:
+                    return b"", ""
+                archive_build = _extract_declared_build(archive.read(foundation_name).decode("utf-8", errors="ignore"))
             plugin_id = re.search(r'(?mi)^id\s*:\s*["\']?([^"\'\s]+)', meta)
-            version = re.search(r'(?mi)^version\s*:\s*["\']?([^"\'\s]+)', meta)
-            if (not plugin_id or str(plugin_id.group(1) or "").strip() != __id__ or not version
-                    or str(version.group(1) or "").strip() != release_version):
+            if (not plugin_id or str(plugin_id.group(1) or "").strip() != __id__
+                    or not archive_build or archive_build != _release_build(release_version)):
                 return b"", ""
             return raw, release_version
         except:
@@ -16255,14 +16292,14 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
 
             skip_version = None if force else str(self.get_setting("plugin_autoupdate_prompted_version", "") or "")
             if _is_elyx_runtime():
-                archive_bytes, remote_version = self._fetch_elyx_update_archive(newer_than=__version__, skip_version=skip_version)
+                archive_bytes, remote_version = self._fetch_elyx_update_archive(newer_than=GREENPASS_BUILD, skip_version=skip_version)
                 self._autoupdate_last_seen_version = str(remote_version or "")
                 self._save_config()
                 if not remote_version:
                     if force:
                         run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось проверить обновления GreenPass"))
                     return False
-                if not _is_version_newer(remote_version, __version__):
+                if _release_build(remote_version) <= GREENPASS_BUILD:
                     if force:
                         run_on_ui_thread(lambda: BulletinHelper.show_success("Установлена актуальная версия GreenPass"))
                     return False
@@ -16282,7 +16319,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 run_on_ui_thread(lambda: self._show_plugin_update_available(remote_version, archive_path))
                 return True
 
-            remote_text, remote_version = self._fetch_plugin_update_text(newer_than=__version__, skip_version=skip_version)
+            remote_text, remote_version = self._fetch_plugin_update_text(newer_than=GREENPASS_BUILD, skip_version=skip_version)
             if (not self._active) and (not force):
                 return False
             self._autoupdate_last_seen_version = str(remote_version or "")
@@ -16292,7 +16329,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
                 if force:
                     run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось проверить обновления GreenPass"))
                 return False
-            if not _is_version_newer(remote_version, __version__):
+            if _release_build(remote_version) <= GREENPASS_BUILD:
                 if force:
                     run_on_ui_thread(lambda: BulletinHelper.show_success("Установлена актуальная версия GreenPass"))
                 return False

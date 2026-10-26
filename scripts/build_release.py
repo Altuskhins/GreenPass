@@ -29,10 +29,20 @@ def plugin_version():
     return match.group(1)
 
 
+def plugin_build():
+    with open(os.path.join(ROOT, "plugin", "greenpass", "foundation.py"), encoding="utf-8") as f:
+        match = re.search(r"^GREENPASS_BUILD\s*=\s*(\d+)\s*$", f.read(), re.M)
+    if not match:
+        raise SystemExit("GREENPASS_BUILD not found in plugin/greenpass/foundation.py")
+    return int(match.group(1))
+
+
 def main():
     publish = "--release" in sys.argv[1:]
     version = plugin_version()
-    tag = "v" + version
+    build = plugin_build()
+    # Auto-update compares the build id, so it goes into the tag: v2.6.3-b8.
+    tag = "v%s-b%d" % (version, build)
     os.makedirs(BUILDS, exist_ok=True)
     for old in glob.glob(os.path.join(BUILDS, "GreenPass*")):
         os.remove(old)
@@ -47,7 +57,7 @@ def main():
     legacy = os.path.join(BUILDS, "GreenPass.plugin")
     run([sys.executable, os.path.join("scripts", "build_legacy_plugin.py"), "plugin", legacy])
 
-    print("\nBuilt GreenPass %s:\n  %s\n  %s" % (version, elyx, legacy))
+    print("\nBuilt GreenPass %s build %d (%s):\n  %s\n  %s" % (version, build, tag, elyx, legacy))
 
     if not publish:
         return
@@ -58,7 +68,7 @@ def main():
     notes = os.path.join("release-notes", tag + ".md")
     notes_args = ["--notes-file", notes] if os.path.isfile(os.path.join(ROOT, notes)) else ["--generate-notes"]
     run(["gh", "release", "create", tag, elyx, legacy, "--target", commit,
-         "--title", "GreenPass " + version] + notes_args)
+         "--title", "GreenPass %s (сборка %d)" % (version, build)] + notes_args)
 
 
 if __name__ == "__main__":

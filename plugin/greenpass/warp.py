@@ -20,6 +20,9 @@ WARP_TIMEOUT = 15
 WARP_MAX_RESPONSE = 256 * 1024
 WARP_DEFAULT_ENDPOINT = "engage.cloudflareclient.com:2408"
 WARP_CONF_NAME = "Cloudflare_WARP.conf"
+# UDP ports the WARP edge accepts WireGuard on. DPI often blocks one port but not the
+# others, so every generated config picks one at random.
+WARP_PORTS = (2408, 500, 1701, 4500)
 WARP_DNS = "1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001"
 WARP_MTU = 1280
 # Junk packets only: a plain WireGuard server ignores them. S1/S2/H1-H4 must stay at the
@@ -225,7 +228,22 @@ def build_warp_conf(private_key, peer_public_key, endpoint, v4, v6, obfuscation=
     return "\n".join(lines)
 
 
+def _warp_endpoint_with_random_port(endpoint):
+    value = str(endpoint or "").strip()
+    if value.startswith("[") and "]" in value:
+        host = value[: value.index("]") + 1]
+    elif value.count(":") == 1:
+        host = value.split(":", 1)[0]
+    else:
+        host = value
+    if not host:
+        host = WARP_DEFAULT_ENDPOINT.split(":", 1)[0]
+    port = WARP_PORTS[int.from_bytes(os.urandom(2), "big") % len(WARP_PORTS)]
+    return "%s:%d" % (host, port)
+
+
 def generate_warp_conf(timeout=WARP_TIMEOUT):
     """Register and return the finished .conf text."""
     reg = register_warp(timeout)
-    return build_warp_conf(reg["private_key"], reg["public_key"], reg["endpoint"], reg["v4"], reg["v6"])
+    endpoint = _warp_endpoint_with_random_port(reg["endpoint"])
+    return build_warp_conf(reg["private_key"], reg["public_key"], endpoint, reg["v4"], reg["v6"])

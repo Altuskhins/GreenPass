@@ -2992,7 +2992,7 @@ class SettingsUiMixin:
             ),
             Text(
                 text="Проверить обновления",
-                subtext="Текущая версия: " + str(getattr(self, "version", "") or "?"),
+                subtext="Текущая версия: %s (сборка %d)" % (str(getattr(self, "version", "") or "?"), GREENPASS_BUILD),
                 icon="msg_download_settings",
                 on_click=lambda *a: self._check_plugin_update_now(),
             ),

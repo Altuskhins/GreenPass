@@ -199,9 +199,9 @@ class AwgModeMixin:
 
     # ---- AWG health check -------------------------------------------------
     # A free config can die (server gone, key revoked) while the core keeps
-    # running, so Telegram sits on "Соединение..." until a reinstall. Once a
-    # minute, connect to a Telegram DC through the local AWG proxy; after 3
-    # failures in a row, regenerate the WARP config (or restart a user config).
+    # running, so Telegram sits on "Соединение..." until a reinstall. Every
+    # 30 s, connect to a Telegram DC through the local AWG proxy; after 2
+    # failures in a row (at most once per 3 minutes), regenerate the WARP config (or restart a user config).
     _AWG_HEALTH_TARGETS = (("149.154.167.50", 443), ("149.154.175.50", 443))
 
     def _awg_probe_once(self):
@@ -244,7 +244,7 @@ class AwgModeMixin:
             fails = 0
             last_fix = 0.0
             while self._active:
-                time.sleep(60)
+                time.sleep(30)
                 if not self._active:
                     break
                 try:
@@ -260,7 +260,7 @@ class AwgModeMixin:
                         fails = 0
                         continue
                     fails += 1
-                    if fails < 3 or time.time() - last_fix < 600:
+                    if fails < 2 or time.time() - last_fix < 180:
                         continue
                     fails = 0
                     last_fix = time.time()
