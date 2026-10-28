@@ -10,6 +10,22 @@ class TgWsModeMixin:
     def _is_tgws_mode_selected(self):
         return self._get_connection_mode() == TGWS_KIND
 
+    def _get_tgws_cfproxy_priority(self):
+        try:
+            return bool(self.get_setting("tgws_cfproxy_priority", False))
+        except Exception:
+            return False
+
+    def _on_tgws_cfproxy_priority_changed(self, enabled):
+        # Cloudflare first: skip the direct WebSocket attempt, which only times out
+        # when the network blocks Telegram's WS endpoints.
+        try:
+            self.set_setting("tgws_cfproxy_priority", bool(enabled), reload_settings=False)
+        except Exception:
+            pass
+        if self._get_connection_mode() == TGWS_KIND and self._is_plugin_proxy_enabled():
+            self._restart_tgws_from_settings()
+
     def _get_tgws_voip_relay_enabled(self):
         try:
             return bool(self.get_setting("tgws_voip_relay_enabled", True))
@@ -220,7 +236,12 @@ class TgWsModeMixin:
                 self._tgws_port = 0
                 return False
             self._tgws_port = port
-            config_json = json.dumps({"port": int(port), "verbose": False, "dc_ip": dict(TGWS_DEFAULT_DC_IP)})
+            config_json = json.dumps({
+                "port": int(port),
+                "verbose": False,
+                "dc_ip": dict(TGWS_DEFAULT_DC_IP),
+                "cfproxy_priority": bool(self._get_tgws_cfproxy_priority()),
+            })
             err = self._tgws_core.start(config_json)
             if err:
                 self._tgws_running = False

@@ -1527,7 +1527,7 @@ PROXY_TRANSITION_KILLSWITCH_RESUME_DELAY_SEC = 0.12
 PROXY_TRANSITION_KILLSWITCH_FAILSAFE_SEC = 2.5
 # Updates are ordered by this build id, not by the shown version (like Telegram
 # Desktop): bump it by one for every release. Releases are tagged v<version>-b<build>.
-GREENPASS_BUILD = 8
+GREENPASS_BUILD = 9
 
 
 def _release_build(release_id):
@@ -11384,7 +11384,7 @@ class SettingsUiMixin:
         if state == "paused":
             return "● Прокси приостановлен", accent
         if state == "disconnected":
-            return "● Прокси не подключён", red
+            return "Прокси не подключён", red
         return "● Состояние неизвестно", gray
 
     def _refresh_mode_summary(self):
@@ -11575,7 +11575,7 @@ class SettingsUiMixin:
             elif runtime_state == "paused":
                 tgws_text = "TG WS: приостановлен"
             elif runtime_state == "disconnected":
-                tgws_text = "● Прокси не подключён"
+                tgws_text = "Прокси не подключён"
             else:
                 tgws_text = "TG WS: выключен"
             items.append(Text(
@@ -11782,7 +11782,7 @@ class SettingsUiMixin:
         elif runtime_state == "paused":
             status_text = "TG WS приостановлен"
         elif runtime_state == "disconnected":
-            status_text = "● Прокси не подключён"
+            status_text = "Прокси не подключён"
         else:
             status_text = "TG WS выключен"
         return [
@@ -11800,6 +11800,14 @@ class SettingsUiMixin:
                 icon="msg_retry" if running else "msg_start",
                 on_click=lambda *a: self._restart_tgws_from_settings(),
             ),
+            Switch(
+                key="tgws_cfproxy_priority",
+                text="Сначала Cloudflare",
+                default=bool(self._get_tgws_cfproxy_priority()),
+                subtext="Не пробовать прямой WebSocket. Помогает, если TG WS бесконечно подключается",
+                icon="msg_language",
+                on_change=self._on_tgws_cfproxy_priority_changed,
+            ),
             Text(
                 text="Скопировать tg://proxy",
                 subtext="Ссылка на текущий локальный прокси",
@@ -11815,11 +11823,11 @@ class SettingsUiMixin:
         if running:
             status_text = "AWG работает"
         elif runtime_state == "connecting":
-            status_text = "● Подключение…"
+            status_text = "Подключение…"
         elif runtime_state == "paused":
             status_text = "AWG приостановлен"
         elif runtime_state == "disconnected":
-            status_text = "● Прокси не подключён"
+            status_text = "Прокси не подключён"
         else:
             status_text = "AWG выключен"
         items = [
@@ -14792,6 +14800,22 @@ class TgWsModeMixin:
     def _is_tgws_mode_selected(self):
         return self._get_connection_mode() == TGWS_KIND
 
+    def _get_tgws_cfproxy_priority(self):
+        try:
+            return bool(self.get_setting("tgws_cfproxy_priority", False))
+        except Exception:
+            return False
+
+    def _on_tgws_cfproxy_priority_changed(self, enabled):
+        # Cloudflare first: skip the direct WebSocket attempt, which only times out
+        # when the network blocks Telegram's WS endpoints.
+        try:
+            self.set_setting("tgws_cfproxy_priority", bool(enabled), reload_settings=False)
+        except Exception:
+            pass
+        if self._get_connection_mode() == TGWS_KIND and self._is_plugin_proxy_enabled():
+            self._restart_tgws_from_settings()
+
     def _get_tgws_voip_relay_enabled(self):
         try:
             return bool(self.get_setting("tgws_voip_relay_enabled", True))
@@ -15002,7 +15026,12 @@ class TgWsModeMixin:
                 self._tgws_port = 0
                 return False
             self._tgws_port = port
-            config_json = json.dumps({"port": int(port), "verbose": False, "dc_ip": dict(TGWS_DEFAULT_DC_IP)})
+            config_json = json.dumps({
+                "port": int(port),
+                "verbose": False,
+                "dc_ip": dict(TGWS_DEFAULT_DC_IP),
+                "cfproxy_priority": bool(self._get_tgws_cfproxy_priority()),
+            })
             err = self._tgws_core.start(config_json)
             if err:
                 self._tgws_running = False

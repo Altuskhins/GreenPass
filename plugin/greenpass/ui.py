@@ -2402,7 +2402,7 @@ class SettingsUiMixin:
         if state == "paused":
             return "● Прокси приостановлен", accent
         if state == "disconnected":
-            return "● Прокси не подключён", red
+            return "Прокси не подключён", red
         return "● Состояние неизвестно", gray
 
     def _refresh_mode_summary(self):
@@ -2593,7 +2593,7 @@ class SettingsUiMixin:
             elif runtime_state == "paused":
                 tgws_text = "TG WS: приостановлен"
             elif runtime_state == "disconnected":
-                tgws_text = "● Прокси не подключён"
+                tgws_text = "Прокси не подключён"
             else:
                 tgws_text = "TG WS: выключен"
             items.append(Text(
@@ -2800,7 +2800,7 @@ class SettingsUiMixin:
         elif runtime_state == "paused":
             status_text = "TG WS приостановлен"
         elif runtime_state == "disconnected":
-            status_text = "● Прокси не подключён"
+            status_text = "Прокси не подключён"
         else:
             status_text = "TG WS выключен"
         return [
@@ -2818,6 +2818,14 @@ class SettingsUiMixin:
                 icon="msg_retry" if running else "msg_start",
                 on_click=lambda *a: self._restart_tgws_from_settings(),
             ),
+            Switch(
+                key="tgws_cfproxy_priority",
+                text="Сначала Cloudflare",
+                default=bool(self._get_tgws_cfproxy_priority()),
+                subtext="Не пробовать прямой WebSocket. Помогает, если TG WS бесконечно подключается",
+                icon="msg_language",
+                on_change=self._on_tgws_cfproxy_priority_changed,
+            ),
             Text(
                 text="Скопировать tg://proxy",
                 subtext="Ссылка на текущий локальный прокси",
@@ -2833,11 +2841,11 @@ class SettingsUiMixin:
         if running:
             status_text = "AWG работает"
         elif runtime_state == "connecting":
-            status_text = "● Подключение…"
+            status_text = "Подключение…"
         elif runtime_state == "paused":
             status_text = "AWG приостановлен"
         elif runtime_state == "disconnected":
-            status_text = "● Прокси не подключён"
+            status_text = "Прокси не подключён"
         else:
             status_text = "AWG выключен"
         items = [
