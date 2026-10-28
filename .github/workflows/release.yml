@@ -1,7 +1,8 @@
 name: Release
 
-# Publishes GreenPass.elyx + GreenPass.plugin as release v<version> (version from
-# plugin/meta.yml) on a v* tag push or a manual run; skips versions that already
+# Publishes GreenPass.elyx + GreenPass.plugin as release v<version>-b<build> (version
+# from plugin/meta.yml, build from GREENPASS_BUILD in plugin/greenpass/foundation.py)
+# on a v* tag push or a manual run; skips versions that already
 # have a release. Locally the same build is build.bat / scripts/build_release.py.
 on:
   push:
@@ -23,11 +24,15 @@ jobs:
         id: version
         run: |
           version=$(sed -n 's/^version: *"\{0,1\}\([^"]*\)"\{0,1\} *$/\1/p' plugin/meta.yml)
-          tag="v$version"
+          build=$(sed -n 's/^GREENPASS_BUILD *= *\([0-9][0-9]*\) *$/\1/p' plugin/greenpass/foundation.py)
+          if [ -z "$build" ]; then echo "GREENPASS_BUILD not found"; exit 1; fi
+          # Auto-update compares the build id, so releases are tagged v<version>-b<build>.
+          tag="v$version-b$build"
           if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "$tag" ]; then
-            echo "tag $GITHUB_REF_NAME != meta.yml version $version"; exit 1
+            echo "tag $GITHUB_REF_NAME != expected $tag (meta.yml version + GREENPASS_BUILD)"; exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "title=GreenPass $version (сборка $build)" >> "$GITHUB_OUTPUT"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $tag already exists, nothing to publish."
             echo "exists=true" >> "$GITHUB_OUTPUT"
@@ -58,4 +63,4 @@ jobs:
           if [ -f "$notes" ]; then notes_arg=(--notes-file "$notes"); else notes_arg=(--generate-notes); fi
           gh release create "$tag" dist/GreenPass.elyx dist/GreenPass.plugin \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "GreenPass ${tag#v}" "${notes_arg[@]}"
+            --title "${{ steps.version.outputs.title }}" "${notes_arg[@]}"
