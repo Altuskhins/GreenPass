@@ -228,7 +228,7 @@ def build_warp_conf(private_key, peer_public_key, endpoint, v4, v6, obfuscation=
     return "\n".join(lines)
 
 
-def _warp_endpoint_with_random_port(endpoint):
+def _warp_endpoint_with_random_port(endpoint, port=None):
     value = str(endpoint or "").strip()
     if value.startswith("[") and "]" in value:
         host = value[: value.index("]") + 1]
@@ -238,12 +238,13 @@ def _warp_endpoint_with_random_port(endpoint):
         host = value
     if not host:
         host = WARP_DEFAULT_ENDPOINT.split(":", 1)[0]
-    port = WARP_PORTS[int.from_bytes(os.urandom(2), "big") % len(WARP_PORTS)]
-    return "%s:%d" % (host, port)
+    if not port:
+        port = WARP_PORTS[int.from_bytes(os.urandom(2), "big") % len(WARP_PORTS)]
+    return "%s:%d" % (host, int(port))
 
 
-def generate_warp_conf(timeout=WARP_TIMEOUT):
-    """Register and return the finished .conf text."""
+def generate_warp_conf(timeout=WARP_TIMEOUT, port=None):
+    """Register and return the finished .conf text. port=None picks a random WARP port."""
     reg = register_warp(timeout)
-    endpoint = _warp_endpoint_with_random_port(reg["endpoint"])
+    endpoint = _warp_endpoint_with_random_port(reg["endpoint"], port)
     return build_warp_conf(reg["private_key"], reg["public_key"], endpoint, reg["v4"], reg["v6"])

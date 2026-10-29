@@ -658,7 +658,7 @@ PROXY_TRANSITION_KILLSWITCH_RESUME_DELAY_SEC = 0.12
 PROXY_TRANSITION_KILLSWITCH_FAILSAFE_SEC = 2.5
 # Updates are ordered by this build id, not by the shown version (like Telegram
 # Desktop): bump it by one for every release. Releases are tagged v<version>-b<build>.
-GREENPASS_BUILD = 10
+GREENPASS_BUILD = 11
 
 
 def _release_build(release_id):

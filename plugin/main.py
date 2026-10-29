@@ -863,7 +863,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
             with open(str(file_path), "r", encoding="utf-8") as f:
                 text = f.read()
             node = _singbox_node_from_config_text(text, display_name or os.path.basename(str(file_path)))
-            prepared = _prepare_singbox_file_config(text, VLESS_LOCAL_PORT)
+            prepared = _prepare_singbox_file_config(text, self._local_port(VLESS_KIND))
             validation_error = self._validate_core_config_for_import(prepared, "sing-box config")
             if validation_error:
                 raise Exception(validation_error)
@@ -898,7 +898,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
             node = _mihomo_node_from_config_text(text, display_name or os.path.basename(str(file_path)))
             prepared = _build_mihomo_core_config(
                 config_text=text,
-                local_port=VLESS_LOCAL_PORT,
+                local_port=self._local_port(VLESS_KIND),
                 work_dir=os.path.join(self._vless_dir, "mihomo"),
                 socks_username="greenpass",
                 socks_password=str(self._vless_socks_password or ""),
@@ -2206,7 +2206,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
             "client_id": self._get_olcrtc_client_id(),
             "key_hex": self._get_olcrtc_key_hex(),
             "socks_listen_host": VLESS_LOCAL_HOST,
-            "socks_port": int(OLCRTC_LOCAL_PORT),
+            "socks_port": int(self._local_port(OLCRTC_KIND)),
             "socks_user": "",
             "socks_pass": "",
             "dns_server": "1.1.1.1:53",
@@ -3905,8 +3905,31 @@ Java.perform(function () {
         with self._vless_transition_lock:
             return int(self._vless_generation or 0) == int(generation)
 
+    def _local_port(self, kind):
+        """Local 127.0.0.1 port of a mode: the user's value from "Локальные порты", else the default."""
+        defaults = {
+            VLESS_KIND: VLESS_LOCAL_PORT,
+            TGWS_KIND: TGWS_LOCAL_PORT,
+            AWG_KIND: AWG_LOCAL_PORT,
+            OLCRTC_KIND: OLCRTC_LOCAL_PORT,
+        }
+        default = int(defaults.get(kind, 0) or 0)
+        try:
+            value = int(str(self.get_setting("local_port_" + str(kind), "") or "").strip() or 0)
+        except Exception:
+            value = 0
+        return value if 1024 <= value <= 65535 else default
+
+    def _warp_port_setting(self):
+        """User's WARP server port, or None for a random one."""
+        try:
+            value = int(str(self.get_setting("awg_warp_port", "") or "").strip() or 0)
+        except Exception:
+            value = 0
+        return value if 1 <= value <= 65535 else None
+
     def _pick_vless_runtime_port(self):
-        preferred = int(VLESS_LOCAL_PORT)
+        preferred = int(self._local_port(VLESS_KIND))
         avoid_preferred = bool(getattr(self, "_vless_avoid_preferred_port_once", False))
         self._vless_avoid_preferred_port_once = False
         if (not avoid_preferred) and _wait_vless_port_closed(preferred, timeout_sec=1.5, poll_sec=0.1):
@@ -4091,7 +4114,7 @@ Java.perform(function () {
             try:
                 config_json = _build_mihomo_core_config(
                     links=[uri],
-                    local_port=VLESS_LOCAL_PORT,
+                    local_port=self._local_port(VLESS_KIND),
                     work_dir=os.path.join(self._vless_dir, "mihomo"),
                     socks_username="greenpass",
                     socks_password=str(self._vless_socks_password or ""),
@@ -4099,7 +4122,7 @@ Java.perform(function () {
             except Exception:
                 config_json = None
         else:
-            config_json, _ = _build_registered_proxy_config(uri, VLESS_LOCAL_PORT)
+            config_json, _ = _build_registered_proxy_config(uri, self._local_port(VLESS_KIND))
         if not config_json:
             return "Плагин не умеет собрать конфиг %s" % label
         return self._validate_core_config_for_import(config_json, label)
@@ -4278,7 +4301,7 @@ Java.perform(function () {
             try:
                 # Cloudflare WARP: every call registers a new, unique device.
                 filename = WARP_CONF_NAME
-                text = generate_warp_conf()
+                text = generate_warp_conf(port=self._warp_port_setting())
                 self._awg_conf_name = filename
                 self._awg_conf_content = text
                 self._save_config()
@@ -4339,7 +4362,7 @@ Java.perform(function () {
             try:
                 prepared = _build_mihomo_core_config(
                     config_text=str((existing or {}).get("raw_config", "") or ""),
-                    local_port=VLESS_LOCAL_PORT,
+                    local_port=self._local_port(VLESS_KIND),
                     work_dir=os.path.join(self._vless_dir, "mihomo"),
                     socks_username="greenpass",
                     socks_password=str(self._vless_socks_password or ""),
@@ -4355,7 +4378,7 @@ Java.perform(function () {
             node = self._save_vless_manual_node(existing)
         elif existing_kind == "singbox-config":
             try:
-                prepared = _prepare_singbox_file_config(str((existing or {}).get("raw_config", "") or ""), VLESS_LOCAL_PORT)
+                prepared = _prepare_singbox_file_config(str((existing or {}).get("raw_config", "") or ""), self._local_port(VLESS_KIND))
             except Exception as exc:
                 BulletinHelper.show_error("Ошибка конфига sing-box: %s" % str(exc))
                 return False
@@ -5751,7 +5774,7 @@ Java.perform(function () {
                 elif self._should_run_awg() and not self._restore_running_awg_proxy(force_reapply=True):
                     self._ensure_awg_core_then(self._awg_connect)
                 elif self._should_run_olcrtc():
-                    port = int(self._olcrtc_port or OLCRTC_LOCAL_PORT)
+                    port = int(self._olcrtc_port or self._local_port(OLCRTC_KIND))
                     local_alive = self._olcrtc_local_ready(port, check_tunnel=False, reason="resume")
                     core_state = str(self._olcrtc_core_status_data().get("state", "") or "").lower()
                     if local_alive and self._olcrtc_state_needs_restart(core_state):
@@ -5874,7 +5897,7 @@ Java.perform(function () {
                     self._ensure_awg_core_then(self._awg_connect)
             elif self._should_run_olcrtc():
                 if (not bool(getattr(self, "_olcrtc_backgrounded", False))) and (not bool(getattr(self, "_olcrtc_connecting", False))):
-                    port = int(self._olcrtc_port or OLCRTC_LOCAL_PORT)
+                    port = int(self._olcrtc_port or self._local_port(OLCRTC_KIND))
                     local_alive = self._olcrtc_local_ready(port, check_tunnel=False, reason="worker_start")
                     core_state = str(self._olcrtc_core_status_data().get("state", "") or "").lower()
                     if local_alive and self._olcrtc_state_needs_restart(core_state):
@@ -5947,7 +5970,7 @@ Java.perform(function () {
                 if self._should_run_olcrtc():
                     if bool(getattr(self, "_olcrtc_backgrounded", False)):
                         continue
-                    port = int(self._olcrtc_port or OLCRTC_LOCAL_PORT)
+                    port = int(self._olcrtc_port or self._local_port(OLCRTC_KIND))
                     local_alive = self._olcrtc_local_ready(port, check_tunnel=False, reason="worker")
                     core_state = str(self._olcrtc_core_status_data().get("state", "") or "").lower()
                     if local_alive and self._olcrtc_state_needs_restart(core_state):

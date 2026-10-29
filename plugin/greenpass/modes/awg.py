@@ -21,7 +21,7 @@ class AwgModeMixin:
         if not self._should_run_awg():
             return False
         try:
-            return bool(self._is_local_proxy_applied(int(self._awg_port or AWG_LOCAL_PORT), owner=AWG_KIND))
+            return bool(self._is_local_proxy_applied(int(self._awg_port or self._local_port(AWG_KIND)), owner=AWG_KIND))
         except Exception:
             return False
 
@@ -31,7 +31,7 @@ class AwgModeMixin:
         started_conf = str(getattr(self, "_awg_started_conf", "") or "")
         if started_conf and started_conf != str(self._awg_conf_content or "").strip():
             return False
-        port = int(self._awg_port or AWG_LOCAL_PORT)
+        port = int(self._awg_port or self._local_port(AWG_KIND))
         if not _check_vless_socks_ready(port, timeout=0.35):
             return False
         applied = self._is_local_proxy_applied(port, owner=AWG_KIND)
@@ -121,7 +121,7 @@ class AwgModeMixin:
                 self._ensure_awg_core_then(self._awg_connect)
                 return False
 
-            port = int(AWG_LOCAL_PORT)
+            port = int(self._local_port(AWG_KIND))
             self._awg_port = port
             if not self._should_run_awg():
                 self._awg_port = 0
@@ -205,7 +205,7 @@ class AwgModeMixin:
     _AWG_HEALTH_TARGETS = (("149.154.167.50", 443), ("149.154.175.50", 443))
 
     def _awg_probe_once(self):
-        port = int(self._awg_port or AWG_LOCAL_PORT)
+        port = int(self._awg_port or self._local_port(AWG_KIND))
         for host, dport in self._AWG_HEALTH_TARGETS:
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=10.0) as sock:
@@ -224,7 +224,7 @@ class AwgModeMixin:
     def _awg_health_fix(self):
         if str(self._awg_conf_name or "") == WARP_CONF_NAME:
             try:
-                text = generate_warp_conf()
+                text = generate_warp_conf(port=self._warp_port_setting())
                 self._awg_conf_content = text
                 self._save_config()
                 run_on_ui_thread(lambda: BulletinHelper.show_info("AWG не отвечал — создан новый WARP конфиг"))

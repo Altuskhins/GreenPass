@@ -229,7 +229,7 @@ class TgWsModeMixin:
             self._tgws_ready = False
             if not self._should_run_tgws():
                 return False
-            port = _pick_tgws_port(TGWS_LOCAL_PORT)
+            port = _pick_tgws_port(self._local_port(TGWS_KIND))
             if int(port or 0) <= 0:
                 self._tgws_running = False
                 self._tgws_ready = False

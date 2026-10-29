@@ -446,7 +446,7 @@ class OlcRtcModeMixin:
         run_on_ui_thread(lambda: self._refresh_settings_without_reopen(reload_main=True, reload_stack=True))
         if old_port > 0:
             self._clear_local_socks_proxy_if_port(old_port, owner=OLCRTC_KIND)
-        port = int(OLCRTC_LOCAL_PORT)
+        port = int(self._local_port(OLCRTC_KIND))
 
         self._olcrtc_port = port
         self._olcrtc_start_in_progress = True

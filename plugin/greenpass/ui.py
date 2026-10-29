@@ -2353,9 +2353,9 @@ class SettingsUiMixin:
             )
         elif target == OLCRTC_KIND:
             try:
-                port = int(self._olcrtc_port or (owner_port if owner == OLCRTC_KIND else 0) or OLCRTC_LOCAL_PORT)
+                port = int(self._olcrtc_port or (owner_port if owner == OLCRTC_KIND else 0) or self._local_port(OLCRTC_KIND))
             except:
-                port = int(OLCRTC_LOCAL_PORT)
+                port = int(self._local_port(OLCRTC_KIND))
             try:
                 ready = bool(port > 0 and self._is_local_olcrtc_proxy_applied(port))
             except:
@@ -2863,6 +2863,13 @@ class SettingsUiMixin:
                 icon="msg_download",
                 on_click=lambda *a: self._download_free_awg_config(),
             ),
+            EditText(
+                key="awg_warp_port",
+                hint="Порт WARP: пусто — случайный (2408, 500, 1701, 4500)",
+                default=str(self.get_setting("awg_warp_port", "") or ""),
+                multiline=False,
+                max_length=5,
+            ),
             Text(
                 text="Выбрать .conf",
                 subtext=conf_name,
@@ -3028,6 +3035,17 @@ class SettingsUiMixin:
                 icon="msg_edit",
                 on_click=lambda *a: self._regenerate_subscription_hwid(),
             ),
+            Divider(),
+            Header(text="Локальные порты"),
+            Text(
+                text="Свои порты 127.0.0.1",
+                subtext="Пусто — по умолчанию. Применяется после перезапуска режима",
+                icon="msg_settings",
+            ),
+            EditText(key="local_port_vless", hint="sing-box / VLESS (по умолчанию %d)" % VLESS_LOCAL_PORT, default=str(self.get_setting("local_port_vless", "") or ""), multiline=False, max_length=5),
+            EditText(key="local_port_tgws", hint="TG WS (по умолчанию %d)" % TGWS_LOCAL_PORT, default=str(self.get_setting("local_port_tgws", "") or ""), multiline=False, max_length=5),
+            EditText(key="local_port_awg", hint="AmneziaWG (по умолчанию %d)" % AWG_LOCAL_PORT, default=str(self.get_setting("local_port_awg", "") or ""), multiline=False, max_length=5),
+            EditText(key="local_port_olcrtc", hint="olcRTC (по умолчанию %d)" % OLCRTC_LOCAL_PORT, default=str(self.get_setting("local_port_olcrtc", "") or ""), multiline=False, max_length=5),
             Divider(),
             Header(text="Сеть"),
             Switch(
