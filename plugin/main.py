@@ -1133,6 +1133,7 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         try:
             self._autoupdate_last_check_ts = now_ts
             self._save_config()
+            self._run_component_update_checks(force=force)
 
             skip_version = None if force else str(self.get_setting("plugin_autoupdate_prompted_version", "") or "")
             if _is_elyx_runtime():
@@ -1208,6 +1209,22 @@ class SafeBypassPlugin(SettingsUiMixin, SingBoxModeMixin, AwgModeMixin, OlcRtcMo
         self._vless_prepare_in_progress = in_progress
         if changed:
             run_on_ui_thread(lambda: self._refresh_settings_without_reopen(reload_main=True, reload_stack=True))
+
+    def _run_component_update_checks(self, force=False):
+        # Libraries and data are checked on the plugin's update schedule (and by the
+        # "Проверить обновления" button): the native core against the manifest of this
+        # build, and TG WS's Cloudflare domain list from upstream.
+        try:
+            self._update_outdated_core_in_background(force=force)
+        except Exception:
+            pass
+        if bool(getattr(self, "_tgws_running", False)):
+            def _refresh_domains():
+                try:
+                    self._tgws_core._refresh_cfproxy_domains()
+                except Exception:
+                    pass
+            threading.Thread(target=_refresh_domains, daemon=True).start()
 
     def _update_outdated_core_in_background(self, force=False):
         if (not force) and (not self._core_autoupdate_enabled()):

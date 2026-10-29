@@ -658,7 +658,7 @@ PROXY_TRANSITION_KILLSWITCH_RESUME_DELAY_SEC = 0.12
 PROXY_TRANSITION_KILLSWITCH_FAILSAFE_SEC = 2.5
 # Updates are ordered by this build id, not by the shown version (like Telegram
 # Desktop): bump it by one for every release. Releases are tagged v<version>-b<build>.
-GREENPASS_BUILD = 9
+GREENPASS_BUILD = 10
 
 
 def _release_build(release_id):
@@ -672,7 +672,7 @@ def _extract_declared_build(text):
     return int(match.group(1)) if match else 0
 
 
-PLUGIN_AUTOUPDATE_CHECK_INTERVAL_SEC = 3 * 60 * 60
+PLUGIN_AUTOUPDATE_CHECK_INTERVAL_SEC = 24 * 60 * 60
 
 
 def _is_tg_proxy_enabled():
