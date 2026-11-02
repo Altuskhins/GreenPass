@@ -24,7 +24,10 @@ WARP_CONF_NAME = "Cloudflare_WARP.conf"
 # others, so every generated config picks one at random.
 WARP_PORTS = (2408, 500, 1701, 4500)
 WARP_DNS = "1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001"
-WARP_MTU = 1280
+# 1200, not 1280: with 1280 the outer UDP packet is ~1340-1360 bytes, which does not fit
+# mobile networks that carry IPv4 over IPv6 (464XLAT/CLAT, MTU ~1280) and fails with
+# "sendmsg: message too long".
+WARP_MTU = 1200
 # Junk packets only: a plain WireGuard server ignores them. S1/S2/H1-H4 must stay at the
 # WireGuard defaults or the WARP server drops the handshake.
 WARP_OBFUSCATION = (("Jc", 4), ("Jmin", 40), ("Jmax", 70))

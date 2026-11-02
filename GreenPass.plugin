@@ -1527,7 +1527,7 @@ PROXY_TRANSITION_KILLSWITCH_RESUME_DELAY_SEC = 0.12
 PROXY_TRANSITION_KILLSWITCH_FAILSAFE_SEC = 2.5
 # Updates are ordered by this build id, not by the shown version (like Telegram
 # Desktop): bump it by one for every release. Releases are tagged v<version>-b<build>.
-GREENPASS_BUILD = 11
+GREENPASS_BUILD = 12
 
 
 def _release_build(release_id):
@@ -13726,7 +13726,10 @@ WARP_CONF_NAME = "Cloudflare_WARP.conf"
 # others, so every generated config picks one at random.
 WARP_PORTS = (2408, 500, 1701, 4500)
 WARP_DNS = "1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001"
-WARP_MTU = 1280
+# 1200, not 1280: with 1280 the outer UDP packet is ~1340-1360 bytes, which does not fit
+# mobile networks that carry IPv4 over IPv6 (464XLAT/CLAT, MTU ~1280) and fails with
+# "sendmsg: message too long".
+WARP_MTU = 1200
 # Junk packets only: a plain WireGuard server ignores them. S1/S2/H1-H4 must stay at the
 # WireGuard defaults or the WARP server drops the handshake.
 WARP_OBFUSCATION = (("Jc", 4), ("Jmin", 40), ("Jmax", 70))
@@ -14044,6 +14047,19 @@ class AwgModeMixin:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _migrate_warp_mtu(self):
+        # WARP configs generated before build 12 carry MTU 1280; lower them in place.
+        try:
+            if str(self._awg_conf_name or "") != WARP_CONF_NAME:
+                return
+            text = str(self._awg_conf_content or "")
+            fixed = re.sub(r"(?mi)^(\s*MTU\s*=\s*)1280\s*$", r"\g<1>1200", text)
+            if fixed != text:
+                self._awg_conf_content = fixed
+                self._save_config()
+        except Exception:
+            pass
+
     def _awg_connect(self):
         if not self._should_run_awg():
             self._awg_connecting = False
@@ -14051,6 +14067,7 @@ class AwgModeMixin:
         self._awg_connecting = True
         run_on_ui_thread(lambda: self._refresh_settings_without_reopen(reload_main=True, reload_stack=True))
         try:
+            self._migrate_warp_mtu()
             conf_content = str(self._awg_conf_content or "").strip()
             if not conf_content:
                 self._awg_running = False

@@ -98,6 +98,19 @@ class AwgModeMixin:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _migrate_warp_mtu(self):
+        # WARP configs generated before build 12 carry MTU 1280; lower them in place.
+        try:
+            if str(self._awg_conf_name or "") != WARP_CONF_NAME:
+                return
+            text = str(self._awg_conf_content or "")
+            fixed = re.sub(r"(?mi)^(\s*MTU\s*=\s*)1280\s*$", r"\g<1>1200", text)
+            if fixed != text:
+                self._awg_conf_content = fixed
+                self._save_config()
+        except Exception:
+            pass
+
     def _awg_connect(self):
         if not self._should_run_awg():
             self._awg_connecting = False
@@ -105,6 +118,7 @@ class AwgModeMixin:
         self._awg_connecting = True
         run_on_ui_thread(lambda: self._refresh_settings_without_reopen(reload_main=True, reload_stack=True))
         try:
+            self._migrate_warp_mtu()
             conf_content = str(self._awg_conf_content or "").strip()
             if not conf_content:
                 self._awg_running = False
