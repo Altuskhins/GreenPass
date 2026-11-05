@@ -26,12 +26,12 @@ jobs:
       - name: Apply GreenPass olcRTC transport patch
         run: git -C turnlib/olcrtc apply ../patches/olcrtc-seichannel.patch
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: sing-box-extended/go.mod
           cache: false
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 

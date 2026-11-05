@@ -242,12 +242,21 @@ def _tgws_set_socket_options(sock):
         pass
 
 
+_TGWS_XOR_TABLES = tuple(bytes(value ^ key for value in range(256)) for key in range(256))
+
+
 def _tgws_xor_mask(data, mask):
     # XOR the whole payload as one big integer (as upstream does): a per-byte
     # Python loop capped upload speed on every masked WS frame.
     if not mask or not data:
         return data
     n = len(data)
+    if n >= 512:
+        # Upstream v1.11.4: translate tables beat the big-int XOR on large frames.
+        masked = bytearray(data)
+        for offset in range(4):
+            masked[offset::4] = masked[offset::4].translate(_TGWS_XOR_TABLES[mask[offset]])
+        return bytes(masked)
     mask_rep = (bytes(mask) * (n // 4 + 1))[:n]
     return (int.from_bytes(data, "big") ^ int.from_bytes(mask_rep, "big")).to_bytes(n, "big")
 
@@ -376,7 +385,7 @@ def _tgws_random_relay_init():
         if raw[0] == 0xEF:
             continue
         first4 = bytes(raw[:4])
-        if first4 in (b"HEAD", b"POST", b"GET ", b"\xee\xee\xee\xee", b"\xdd\xdd\xdd\xdd"):
+        if first4 in (b"HEAD", b"POST", b"GET ", b"OPTI", b"\xee\xee\xee\xee", b"\xdd\xdd\xdd\xdd"):
             continue
         if raw[0] == 0x16 and raw[1] == 0x03 and raw[2] == 0x01 and raw[3] == 0x02:
             continue
@@ -771,6 +780,15 @@ def _tgws_load_android_cas(ctx):
             return
 
 
+def _tgws_set_x25519(ctx):
+    # Upstream v1.11.3: offer only X25519. The X25519MLKEM768 key share makes the
+    # ClientHello large enough to trip DPI, which shows up as TimeoutError.
+    try:
+        ctx.set_ecdh_curve("X25519")
+    except:
+        pass
+
+
 def _tgws_ssl_context(check_hostname=True):
     # Like upstream tg-ws-proxy: verify certificates (certifi + system store);
     # fronted connections verify the chain but not the hostname. Without any
@@ -788,6 +806,7 @@ def _tgws_ssl_context(check_hostname=True):
             pass
         if not _tgws_ca_count(ctx):
             _tgws_load_android_cas(ctx)
+        _tgws_set_x25519(ctx)
         if _tgws_ca_count(ctx):
             ctx.check_hostname = key
         else:
