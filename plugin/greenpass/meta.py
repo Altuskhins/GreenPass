@@ -1,6 +1,6 @@
 __id__ = "GreenPass"
 __name__ = "GreenPass"
-__description__ = "Прокси для Telegram: vless/vmess/hysteria2 и др., встроенные TG WS, AmneziaWG и olcRTC, прокси для звонков"
+__description__ = "Практически универсальный прокси-плагин для exteraGram"
 __author__ = "@AltyPlugins | claude opus 5.5"
 __version__ = "2.6.4"
 __icon__ = "bratpass/0"

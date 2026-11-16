@@ -1,5 +1,5 @@
 name: GreenPass
-description: "Прокси для Telegram: vless/vmess/hysteria2 и др., встроенные TG WS, AmneziaWG и olcRTC, прокси для звонков"
+description: "Практически универсальный прокси-плагин для exteraGram"
 id: GreenPass
 version: "2.6.4"
 author: "@AltyPlugins | claude opus 5.5"
