@@ -5,7 +5,7 @@ import zlib
 from base_plugin import BasePlugin, MethodHook
 from java import jclass
 from org.telegram.messenger import ApplicationLoader
-from .foundation import _set_native_proxy_settings
+from .telegram import set_native_proxy
 from .webproxy_payload import DEX_PAYLOAD_ZLIB_B64
 
 
@@ -27,15 +27,6 @@ def _methods_by_name(cls, *names):
             bucket.append(method)
     return found
 
-
-__id__ = "wp"
-__name__ = "WEB Proxy"
-__description__ = "Ээээ короч диплинки там локал протик ещё какая-то хуйня типа крутяк ок"
-__author__ = "@la_cringe | @dmkrjplug"
-__version__ = "2.1b"
-__icon__ = "akresloh/0"
-__app_version__ = ">=12.9.0"
-__sdk_version__ = ">=1.4.5.3"
 
 ENTRY_CLASS = "com.extera.webproxy.NativeWebProxyCore"
 BuildVersion = jclass("android.os.Build$VERSION")
@@ -646,7 +637,7 @@ class WebProxyNativePlugin(BasePlugin):
 
     def apply_native(self, enabled, port, secret):
         try:
-            _set_native_proxy_settings(
+            set_native_proxy(
                 bool(enabled),
                 address="127.0.0.1",
                 port=int(port or 0),

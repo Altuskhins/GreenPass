@@ -1,285 +1,127 @@
-from ..foundation import *
-from ..protocols import *
-from ..tgws import *
-from ..native import *
-from ..subscriptions import *
-from ..hooks import *
+"""AmneziaWG: a WireGuard/AWG .conf run by sing-box, or a generated Cloudflare WARP config."""
+
+import re
+import time
+
+from .. import net, singbox
+from ..android import toast_error, toast_info, toast_success
 from ..warp import WARP_CONF_NAME, generate_warp_conf
+from .base import CONNECTED, CONNECTING, FAILED, Mode
+
+WARP_PORT_SETTING = "awg_warp_port"
 
 
-class AwgModeMixin:
-    def _libawg_so_path(self):
-        return self._libsingbox_so_path()
+class AwgMode(Mode):
+    kind = "awg"
+    title = "AmneziaWG"
+    default_port = 2337
 
-    def _has_libawg_addon(self):
-        return self._has_libsingbox_addon()
+    def __init__(self, app):
+        super().__init__(app)
+        self._started_conf = ""
+        self._failures = 0
+        self._last_fix = 0.0
 
-    def _is_awg_mode_selected(self):
-        return self._get_connection_mode() == AWG_KIND
+    def has_config(self):
+        return bool(self.app.store.awg_conf_content.strip())
 
-    def _is_awg_connection_ready(self):
-        if not self._should_run_awg():
-            return False
+    def is_warp(self):
+        return self.app.store.awg_conf_name == WARP_CONF_NAME
+
+    def warp_port(self):
+        """User's WARP endpoint port (1-65535), or None for a random one."""
         try:
-            return bool(self._is_local_proxy_applied(int(self._awg_port or self._local_port(AWG_KIND)), owner=AWG_KIND))
-        except Exception:
+            port = int(str(self.app.setting(WARP_PORT_SETTING, "") or "").strip())
+        except ValueError:
+            return None
+        return port if 1 <= port <= 65535 else None
+
+    def is_alive(self):
+        return self.port > 0 and net.socks_ready(self.port, timeout=0.35)
+
+    def connect(self):
+        store = self.app.store
+        if not self.has_config() and not self.generate_warp():
+            self.set_state(FAILED, "Нет конфига AWG")
             return False
+        self._fix_old_warp_mtu()
+        conf = store.awg_conf_content.strip()
+        port = self.local_port()
 
-    def _restore_running_awg_proxy(self, force_reapply=False):
-        if not self._should_run_awg():
-            return False
-        started_conf = str(getattr(self, "_awg_started_conf", "") or "")
-        if started_conf and started_conf != str(self._awg_conf_content or "").strip():
-            return False
-        port = int(self._awg_port or self._local_port(AWG_KIND))
-        if not _check_vless_socks_ready(port, timeout=0.35):
-            return False
-        applied = self._is_local_proxy_applied(port, owner=AWG_KIND)
-        changed = bool(force_reapply) or not bool(self._awg_running) or int(self._awg_port or 0) != port or not applied
-        if (bool(force_reapply) or not applied) and not self._apply_local_socks_proxy(port, True, owner=AWG_KIND):
-            return False
-        self._awg_port = port
-        self._awg_running = True
-        if changed:
-            run_on_ui_thread(lambda: self._refresh_settings_without_reopen(reload_main=True, reload_stack=True))
-        return True
-
-    def _ensure_awg_core_then(self, runner):
-        runner_name = str(getattr(runner, "__name__", "") or "")
-        require_awg_mode = runner_name == "_awg_connect"
-        if require_awg_mode and (not self._should_run_awg()):
-            return
-        if self._go_core_switch_blocked("awg"):
-            return
-        self._awg_core._ensure()
-        if self._awg_core.is_available():
-            if require_awg_mode and (not self._should_run_awg()):
-                return
-            threading.Thread(target=runner, daemon=True).start()
-            return
-        if self._awg_prepare_in_progress:
-            return
-
-        self._awg_prepare_in_progress = True
-        BulletinHelper.show_info("Скачиваю ядро AWG...")
-
-        def _worker():
-            try:
-                ok = self._has_libawg_addon()
-                if ok:
-                    self._reload_awg_core()
-                    self._awg_core._ensure()
-                    if not self._awg_core.is_available():
-                        try:
-                            os.remove(self._libawg_so_path())
-                            self._libsingbox_validation_cache = None
-                        except:
-                            pass
-                        ok = False
-                if not ok:
-                    ok = self._download_libawg_with_progress()
-                    if ok and self._core_restart_required():
-                        run_on_ui_thread(lambda: BulletinHelper.show_success("Ядро установлено — перезапустите приложение"))
-                        return
-                    self._reload_awg_core()
-                    self._awg_core._ensure()
-                if not (ok and self._awg_core.is_available()):
-                    run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось загрузить ядро AWG"))
-                    return
-                if require_awg_mode and (not self._should_run_awg()):
-                    return
-                try:
-                    runner()
-                except Exception as exc:
-                    err_text = str(exc)
-                    run_on_ui_thread(lambda err_text=err_text: BulletinHelper.show_error("Ошибка AWG: %s" % err_text))
-            finally:
-                self._awg_prepare_in_progress = False
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _migrate_warp_mtu(self):
-        # WARP configs generated before build 12 carry MTU 1280; lower them in place.
-        try:
-            if str(self._awg_conf_name or "") != WARP_CONF_NAME:
-                return
-            text = str(self._awg_conf_content or "")
-            fixed = re.sub(r"(?mi)^(\s*MTU\s*=\s*)1280\s*$", r"\g<1>1200", text)
-            if fixed != text:
-                self._awg_conf_content = fixed
-                self._save_config()
-        except Exception:
-            pass
-
-    def _awg_connect(self):
-        if not self._should_run_awg():
-            self._awg_connecting = False
-            return False
-        self._awg_connecting = True
-        run_on_ui_thread(lambda: self._refresh_settings_without_reopen(reload_main=True, reload_stack=True))
-        try:
-            self._migrate_warp_mtu()
-            conf_content = str(self._awg_conf_content or "").strip()
-            if not conf_content:
-                self._awg_running = False
-                self._awg_port = 0
-                self._download_free_awg_config()
-                return False
-
-            if self._restore_running_awg_proxy():
+        # Same config already running: just make sure Telegram uses it.
+        if self._started_conf == conf and net.socks_ready(port, timeout=0.35):
+            self.port = port
+            if self.proxy_applied() or self.apply_proxy(port):
+                self.set_state(CONNECTED)
                 return True
 
-            if not self._awg_core.is_available():
-                self._awg_running = False
-                self._awg_port = 0
-                self._ensure_awg_core_then(self._awg_connect)
-                return False
+        self.set_state(CONNECTING)
+        try:
+            config = singbox.awg_config(conf, port)
+        except (ValueError, TypeError) as exc:
+            self.set_state(FAILED, "Ошибка конфига AWG: %s" % exc)
+            return False
+        error = self.app.start_core(config)
+        if error:
+            self._started_conf = ""
+            self.set_state(FAILED, "Ошибка AWG: %s" % error)
+            toast_error("Ошибка AWG: %s", error)
+            return False
+        self._started_conf = conf
+        self.port = port
+        if not self.apply_proxy(port):
+            self.set_state(FAILED, "Не удалось применить прокси")
+            return False
+        self._failures = 0
+        self.set_state(CONNECTED)
+        toast_success("AmneziaWG подключен")
+        return True
 
-            port = int(self._local_port(AWG_KIND))
-            self._awg_port = port
-            if not self._should_run_awg():
-                self._awg_port = 0
-                return False
-            err = self._awg_core.start(conf_content)
-            if err:
-                self._awg_running = False
-                self._awg_port = 0
-                self._awg_started_conf = ""
-                run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка AWG: %s" % str(err)))
-                return False
+    def stop_runtime(self):
+        if self._started_conf:
+            self._started_conf = ""
+            self.app.stop_core()
 
-            self._awg_started_conf = conf_content
-            self._awg_running = True
-            if not self._should_run_awg():
-                self._awg_running = False
-                self._awg_port = 0
-                return False
-            if not self._apply_local_socks_proxy(port, True, owner=AWG_KIND):
-                self._awg_running = False
-                return False
-            if not self._should_run_awg() or int(self._awg_port or 0) != int(port):
-                self._clear_local_socks_proxy_if_port(port, owner=AWG_KIND)
-                self._awg_running = False
-                return False
-            self._save_config()
-            run_on_ui_thread(lambda: BulletinHelper.show_success("AmneziaWG подключен"))
-            return True
-        finally:
-            self._awg_connecting = False
-            run_on_ui_thread(lambda: self._refresh_settings_without_reopen(reload_main=True, reload_stack=True))
+    def generate_warp(self):
+        """Replace the config with a fresh Cloudflare WARP one. Returns True on success."""
+        try:
+            text = generate_warp_conf(port=self.warp_port())
+        except Exception as exc:
+            toast_error("Не удалось получить WARP конфиг: %s", exc)
+            return False
+        store = self.app.store
+        store.awg_conf_name, store.awg_conf_content = WARP_CONF_NAME, text
+        store.save()
+        return True
 
-    def _awg_disconnect_with_reason(self, reason, silent=False):
-        reason_text = str(reason or "unknown")
-        stop_core = reason_text in ("manual_stop", "restart_awg", "clear_awg_config", "start_failed", "apply_failed")
-        self._awg_disconnect(silent=bool(silent), reason=reason_text, stop_core=bool(stop_core))
+    def _fix_old_warp_mtu(self):
+        # WARP configs made before build 12 use MTU 1280, too big on IPv6 mobile networks.
+        store = self.app.store
+        if self.is_warp():
+            fixed = re.sub(r"(?mi)^(\s*MTU\s*=\s*)1280\s*$", r"\g<1>1200", store.awg_conf_content)
+            if fixed != store.awg_conf_content:
+                store.awg_conf_content = fixed
+                store.save()
 
-    def _awg_disconnect(self, silent=False, reason="unknown", stop_core=False):
-        old_port = int(self._awg_port or 0)
-        if bool(stop_core) and bool(getattr(self._awg_core, "started", False)):
-            try:
-                self._awg_core.stop()
-            except Exception:
-                pass
-            self._awg_started_conf = ""
-        self._awg_running = False
-        self._awg_connecting = False
-        self._awg_port = 0
-        if old_port > 0:
-            self._clear_local_socks_proxy_if_port(old_port, owner=AWG_KIND)
-        if not silent:
-            self._refresh_settings_without_reopen(reload_main=True, reload_stack=True)
-
-    def _ensure_awg_config_then_connect(self):
-        if str(self._awg_conf_content or "").strip():
-            self._ensure_awg_core_then(self._awg_connect)
+    def health_check(self):
+        """A dead free config keeps the core running while Telegram hangs on
+        "Соединение...". After 2 failed Telegram probes in a row (at most once per
+        3 minutes) regenerate WARP, or reconnect a user config."""
+        if self.state != CONNECTED:
+            self._failures = 0
             return
-        self._download_free_awg_config()
-
-    def _switch_to_awg_mode(self, persist_mode=True):
-        if self._go_core_switch_blocked("awg"):
+        if net.telegram_reachable(self.port, timeout=10.0):
+            self._failures = 0
             return
-        if persist_mode:
-            self._set_connection_mode(AWG_KIND)
-        self._vless_disconnect_with_reason("switch_to_awg_mode", silent=True)
-        self._tgws_disconnect_with_reason("switch_to_awg_mode", silent=True)
-        self._olcrtc_disconnect_with_reason("switch_to_awg_mode", silent=True)
-        if not str(self._awg_conf_content or "").strip():
-            self._enable_plugin_proxy_flag()
-            self._ensure_awg_config_then_connect()
+        self._failures += 1
+        if self._failures < 2 or time.monotonic() - self._last_fix < 180:
+            return
+        self._failures = 0
+        self._last_fix = time.monotonic()
+        if self.is_warp():
+            if self.generate_warp():
+                toast_info("AWG не отвечал — создан новый WARP конфиг")
         else:
-            self._enable_plugin_proxy_flag()
-            self._ensure_awg_core_then(self._awg_connect)
-        self._refresh_settings_without_reopen(reload_main=True, reload_stack=True)
-
-    # ---- AWG health check -------------------------------------------------
-    # A free config can die (server gone, key revoked) while the core keeps
-    # running, so Telegram sits on "Соединение..." until a reinstall. Every
-    # 30 s, connect to a Telegram DC through the local AWG proxy; after 2
-    # failures in a row (at most once per 3 minutes), regenerate the WARP config (or restart a user config).
-    _AWG_HEALTH_TARGETS = (("149.154.167.50", 443), ("149.154.175.50", 443))
-
-    def _awg_probe_once(self):
-        port = int(self._awg_port or self._local_port(AWG_KIND))
-        for host, dport in self._AWG_HEALTH_TARGETS:
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=10.0) as sock:
-                    sock.settimeout(10.0)
-                    sock.sendall(b"\x05\x01\x00")
-                    if sock.recv(2) != b"\x05\x00":
-                        continue
-                    sock.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(host) + int(dport).to_bytes(2, "big"))
-                    head = sock.recv(4)
-                    if len(head) >= 2 and head[0] == 5 and head[1] == 0:
-                        return True
-            except Exception:
-                pass
-        return False
-
-    def _awg_health_fix(self):
-        if str(self._awg_conf_name or "") == WARP_CONF_NAME:
-            try:
-                text = generate_warp_conf(port=self._warp_port_setting())
-                self._awg_conf_content = text
-                self._save_config()
-                run_on_ui_thread(lambda: BulletinHelper.show_info("AWG не отвечал — создан новый WARP конфиг"))
-            except Exception as exc:
-                err_text = str(exc)
-                run_on_ui_thread(lambda err_text=err_text: BulletinHelper.show_error("Не удалось обновить WARP: %s" % err_text))
-        else:
-            run_on_ui_thread(lambda: BulletinHelper.show_info("AWG не отвечал — переподключаю"))
-        run_on_ui_thread(self._restart_awg_from_settings)
-
-    def _start_awg_health_thread(self):
-        if bool(getattr(self, "_awg_health_thread_started", False)):
-            return
-        self._awg_health_thread_started = True
-
-        def _loop():
-            fails = 0
-            last_fix = 0.0
-            while self._active:
-                time.sleep(30)
-                if not self._active:
-                    break
-                try:
-                    if (not self._is_awg_connection_ready()) or bool(getattr(self, "_awg_connecting", False)):
-                        fails = 0
-                        continue
-                    try:
-                        if not bool(ApplicationLoader.isNetworkOnline()):
-                            continue
-                    except Exception:
-                        pass
-                    if self._awg_probe_once():
-                        fails = 0
-                        continue
-                    fails += 1
-                    if fails < 2 or time.time() - last_fix < 180:
-                        continue
-                    fails = 0
-                    last_fix = time.time()
-                    self._awg_health_fix()
-                except Exception:
-                    pass
-
-        threading.Thread(target=_loop, daemon=True).start()
+            toast_info("AWG не отвечал — переподключаю")
+        self._started_conf = ""
+        self.app.reconnect()

@@ -30,10 +30,10 @@ def plugin_version():
 
 
 def plugin_build():
-    with open(os.path.join(ROOT, "plugin", "greenpass", "foundation.py"), encoding="utf-8") as f:
+    with open(os.path.join(ROOT, "plugin", "greenpass", "meta.py"), encoding="utf-8") as f:
         match = re.search(r"^GREENPASS_BUILD\s*=\s*(\d+)\s*$", f.read(), re.M)
     if not match:
-        raise SystemExit("GREENPASS_BUILD not found in plugin/greenpass/foundation.py")
+        raise SystemExit("GREENPASS_BUILD not found in plugin/greenpass/meta.py")
     return int(match.group(1))
 
 
@@ -68,7 +68,7 @@ def main():
     notes = os.path.join("release-notes", tag + ".md")
     notes_args = ["--notes-file", notes] if os.path.isfile(os.path.join(ROOT, notes)) else ["--generate-notes"]
     run(["gh", "release", "create", tag, elyx, legacy, "--target", commit,
-         "--title", "GreenPass %s (сборка %d)" % (version, build)] + notes_args)
+         "--title", "GreenPass %s" % version] + notes_args)
 
 
 if __name__ == "__main__":

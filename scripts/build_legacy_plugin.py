@@ -1,102 +1,135 @@
-"""Flatten plugin/ (Elyx sources) into a single-file legacy GreenPass.plugin,
-mirroring the layout of upstream Altuskhins/GreenPass GreenPass.plugin.
+"""Build the single-file GreenPass.plugin from plugin/.
 
-Usage: python scripts/build_legacy_plugin.py plugin builds/GreenPass.plugin
+The plugin's modules stay separate modules: their sources are embedded in a dict
+and served by a small import hook under a package name unique to this build, so
+a reloaded or updated plugin never picks up modules from the previous one.
+The core bundles from plugin/greenpass/core/ are appended as "#GPCORE:<abi>:"
+base64 comment lines, which core.py reads back from the plugin file.
+
+    python scripts/build_plugin.py plugin GreenPass.plugin
 """
-import ast, re, sys, os
 
-SRC = sys.argv[1]            # .../plugin
-OUT = sys.argv[2]
-DEFERRED = {"greenpass.webproxy", "greenpass.tgws_cf_h2"}   # appended after the plugin class (see below)
+import ast
+import base64
+import os
+import re
+import sys
 
-REL_IMPORT = re.compile(r"^from (\.+)([\w.]*) import (.+)$")
-ELYX_IMPORT = "try:\n    from elyx import get_environment as _elyx_get_environment\nexcept:\n    _elyx_get_environment = None\n"
-META_LINE = re.compile(r"^__(id|name|description|author|version|icon|app_version|sdk_version|min_version)__ = ")
+SRC, OUT = sys.argv[1], sys.argv[2]
+PKG_DIR = os.path.join(SRC, "greenpass")
+CORE_DIR = os.path.join(PKG_DIR, "core")
+META_NAMES = ("__id__", "__name__", "__description__", "__author__", "__version__", "__icon__",
+              "__app_version__", "__sdk_version__")
+SKIP = {"__pycache__", "core"}
 
-emitted = set()
+
+def read(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read()
+
+
+meta_src = read(os.path.join(PKG_DIR, "meta.py"))
+build = int(re.search(r"(?m)^GREENPASS_BUILD\s*=\s*(\d+)\s*$", meta_src).group(1))
+package = "_greenpass_b%d" % build
+
+# Metadata first, as literal assignments the client can read without running code.
+meta_values = {}
+for node in ast.parse(meta_src).body:
+    if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) and node.targets[0].id in META_NAMES:
+        meta_values[node.targets[0].id] = ast.literal_eval(node.value)
+missing = [n for n in META_NAMES if n not in meta_values]
+if missing:
+    raise SystemExit("meta.py lacks %s" % missing)
+
+sources = {}
+for root, dirs, files in os.walk(PKG_DIR):
+    dirs[:] = sorted(d for d in dirs if d not in SKIP)
+    for name in sorted(files):
+        if not name.endswith(".py"):
+            continue
+        path = os.path.join(root, name)
+        rel = os.path.relpath(path, SRC).replace(os.sep, "/")[:-3]
+        module = rel.replace("/", ".")
+        if module.endswith(".__init__"):
+            module = module[:-len(".__init__")]
+        text = read(path)
+        compile(text, path, "exec")
+        sources[module] = (text, name == "__init__.py")
+for package_name in {m.rsplit(".", 1)[0] for m in sources if "." in m}:
+    sources.setdefault(package_name, ("", True))
+
+main = read(os.path.join(SRC, "main.py"))
+main = re.sub(r"(?m)^(\s*)from \.greenpass\b", r"\1from %s.greenpass" % package, main)
+main = main.replace("from .greenpass import", "from %s.greenpass import" % package)
+if re.search(r"(?m)^\s*from \.", main):
+    raise SystemExit("main.py has a relative import the builder does not handle")
+
 out = []
+for name in META_NAMES:
+    out.append("%s = %r\n" % (name, meta_values[name]))
+out.append("GREENPASS_BUILD = %d\n\n" % build)
+out.append('''
+import importlib.abc as _gp_abc
+import importlib.util as _gp_util
+import sys as _gp_sys
+
+_GP_PACKAGE = %r
+_GP_SOURCES = {
+''' % package)
+for module in sorted(sources):
+    text, is_package = sources[module]
+    out.append("    %r: (%r, %r),\n" % (package + "." + module, text, is_package))
+out.append('''}
+_GP_SOURCES[_GP_PACKAGE] = ("", True)
 
 
-def mod_path(mod):
-    return os.path.join(SRC, *mod.split(".")) + ".py"
+class _GreenPassImporter(_gp_abc.MetaPathFinder, _gp_abc.Loader):
+    """Serves this build's modules from _GP_SOURCES."""
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname not in _GP_SOURCES:
+            return None
+        return _gp_util.spec_from_loader(fullname, self, is_package=_GP_SOURCES[fullname][1])
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        source, is_package = _GP_SOURCES[module.__name__]
+        module.__file__ = __file__
+        if is_package:
+            module.__path__ = []
+        exec(compile(source, __file__, "exec"), module.__dict__)
 
 
-def resolve(current, dots, name):
-    pkg = current.split(".")[:-1]
-    if len(dots) > 1:
-        pkg = pkg[: len(pkg) - (len(dots) - 1)]
-    return ".".join([p for p in pkg + ([name] if name else []) if p])
+for _gp_name in [n for n in _gp_sys.modules if n == _GP_PACKAGE or n.startswith(_GP_PACKAGE + ".")]:
+    del _gp_sys.modules[_gp_name]
+_gp_sys.meta_path[:] = [f for f in _gp_sys.meta_path if type(f).__name__ != "_GreenPassImporter"]
+_gp_sys.meta_path.insert(0, _GreenPassImporter())
 
+# --- main.py ---
+''')
+out.append(main.rstrip() + "\n")
 
-def emit_import(target, names):
-    # "from .pkg import submodule as alias" -> inline the submodule
-    if os.path.isdir(os.path.join(SRC, *target.split("."))):
-        for name in names.split(","):
-            emit_import(target + "." + name.split(" as ")[0].strip(), "*")
-        return
-    if target not in DEFERRED:
-        emit_module(target)
-
-
-def emit_module(mod, strip_meta=False):
-    if mod in emitted:
-        return
-    emitted.add(mod)
-    text = open(mod_path(mod), encoding="utf-8").read()
-    text = text.replace(ELYX_IMPORT, "_elyx_get_environment = None\n")
-    if mod == "greenpass.tgws_cf_h2":
-        # HTTP/2 is optional in legacy installs where the app cannot install
-        # Elyx requirements. Keep the plugin importable and let TG-WS fall back
-        # to WebSocket if httpx/h2 are absent.
-        out.append("# --- optional bundled from %s.py ---\ntry:\n" % mod)
-        out.extend("    " + line if line.strip() else line
-                   for line in text.splitlines(keepends=True))
-        out.append("except ImportError:\n    pass\n\n")
-        return
-    out.append("# --- bundled from %s.py ---\n" % mod)
-    for line in text.splitlines(keepends=True):
-        m = REL_IMPORT.match(line.rstrip("\n"))
-        if m:
-            emit_import(resolve(mod, m.group(1), m.group(2)), m.group(3))
+core_lines = 0
+if os.path.isdir(CORE_DIR):
+    out.append("\n# Embedded GreenPass core (read by greenpass/core.py from this file).\n")
+    abi_by_file = {"libgreenpass.so.xz": "arm64-v8a", "libgreenpass-armeabi-v7a.so.xz": "armeabi-v7a"}
+    for name, abi in sorted(abi_by_file.items()):
+        path = os.path.join(CORE_DIR, name)
+        if not os.path.isfile(path):
             continue
-        if strip_meta and META_LINE.match(line):
-            continue
-        out.append(line)
-    if not out[-1].endswith("\n"):
-        out.append("\n")
-    out.append("\n")
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(57 * 1024)
+                if not chunk:
+                    break
+                out.append("#GPCORE:%s:%s\n" % (abi, base64.b64encode(chunk).decode("ascii")))
+                core_lines += 1
 
-
-# main.py: inline its package imports, drop the _foundation re-exports.
-main = open(os.path.join(SRC, "main.py"), encoding="utf-8").read()
-out.append("# --- bundled from main.py ---\n")
-body = []
-for line in main.splitlines(keepends=True):
-    s = line.rstrip("\n")
-    m = REL_IMPORT.match(s)
-    if m:
-        emit_import(resolve("main", m.group(1), m.group(2)), m.group(3))
-        continue
-    if re.match(r"^__\w+__ = _foundation\.__\w+__$", s):
-        continue
-    line = line.replace("_foundation.__name__", "__name__")
-    # main.py reaches the WEB proxy class through its module alias; in the flat
-    # file the class is a plain global defined after SafeBypassPlugin.
-    body.append(line.replace("_webproxy.WebProxyNativePlugin(", "WebProxyNativePlugin("))
-if "_foundation" in "".join(body):
-    raise SystemExit("unhandled _foundation reference in main.py")
-out.append("# --- main.py ---\n")
-out.extend(body)
-if not out[-1].endswith("\n"):
-    out.append("\n")
-out.append("\n")
-# WebProxyNativePlugin is also a BasePlugin subclass: define it after
-# SafeBypassPlugin so the loader picks GreenPass, and drop its own metadata so
-# it cannot override GreenPass's __id__/__name__/__version__.
-for mod in sorted(DEFERRED):
-    emit_module(mod, strip_meta=True)
-
-result = "".join(out).rstrip() + "\n"
+result = "".join(out)
 ast.parse(result)
-open(OUT, "w", encoding="utf-8", newline="\n").write(result)
-print("wrote", OUT, len(result.encode("utf-8")), "bytes;", "modules:", len(emitted))
+with open(OUT, "w", encoding="utf-8", newline="\n") as handle:
+    handle.write(result)
+print("wrote %s: %d bytes, %d modules, %d core lines, package %s"
+      % (OUT, len(result.encode("utf-8")), len(sources), core_lines, package))

@@ -1,488 +1,270 @@
-from .foundation import *
-from .protocols import *
-from .subscriptions import *
+"""Java method hooks GreenPass installs into Telegram.
 
-def _force_show_dialogs_proxy_button(da):
+Each hook only forwards to the plugin (`gp`); hooks are installed once per
+plugin load and do nothing after unload (gp.active is False).
+"""
+
+import time
+
+from base_plugin import MethodHook
+
+from . import links
+
+try:
+    from hook_utils import find_class
+except Exception:
+    find_class = None
+
+try:
+    from org.telegram.messenger import MessagesController, NotificationCenter
+    from org.telegram.tgnet import ConnectionsManager
+except Exception:
+    MessagesController = NotificationCenter = ConnectionsManager = None
+
+AWG_FILE_PICKER_REQ = 13371
+IMPORT_FILE_PICKER_REQ = 13372
+_LINK_SCHEMES = tuple(links.SCHEMES) + ("wdtt", "qwdtt", "olcrtc")
+
+
+def _cls(name):
     try:
-        if da is None:
-            return
+        return find_class(name) if find_class is not None else None
+    except Exception:
+        return None
 
-        cls = None
-        try:
-            cls = da.getClass()
-        except:
-            cls = None
 
-        proxy_item = None
-        if cls is not None:
-            try:
-                f = cls.getDeclaredField("proxyItem")
-                f.setAccessible(True)
-                proxy_item = f.get(da)
-            except:
-                proxy_item = None
+def _field(obj, name):
+    field = obj.getClass().getDeclaredField(name)
+    field.setAccessible(True)
+    return field
 
-        if proxy_item is not None:
-            try:
-                from android.view import View
-                proxy_item.setVisibility(View.VISIBLE)
-            except:
-                pass
 
-        if cls is not None:
-            try:
-                vf = cls.getDeclaredField("proxyItemVisible")
-                vf.setAccessible(True)
-                try:
-                    vf.setBoolean(da, True)
-                except:
-                    vf.set(da, True)
-            except:
-                pass
-
-        proxy_drawable = None
-        if cls is not None:
-            try:
-                df = cls.getDeclaredField("proxyDrawable")
-                df.setAccessible(True)
-                proxy_drawable = df.get(da)
-            except:
-                proxy_drawable = None
-
-        if proxy_drawable is not None:
-            state = None
-            try:
-                sf = cls.getDeclaredField("currentConnectionState")
-                sf.setAccessible(True)
-                state = sf.getInt(da)
-            except:
-                state = None
-
-            enabled = _is_tg_proxy_enabled()
-            connected = False
-            try:
-                connected = (
-                    state == ConnectionsManager.ConnectionStateConnected
-                    or state == ConnectionsManager.ConnectionStateUpdating
-                )
-            except:
-                connected = False
-
-            try:
-                proxy_drawable.setConnected(bool(enabled), bool(connected), False)
-            except:
-                pass
-    except:
+def show_proxy_button(dialogs_activity):
+    """Keep the shield in the chat list visible and in sync with the proxy state."""
+    try:
+        from android.view import View
+        _field(dialogs_activity, "proxyItem").get(dialogs_activity).setVisibility(View.VISIBLE)
+    except Exception:
+        pass
+    try:
+        _field(dialogs_activity, "proxyItemVisible").setBoolean(dialogs_activity, True)
+    except Exception:
+        pass
+    try:
+        drawable = _field(dialogs_activity, "proxyDrawable").get(dialogs_activity)
+        state = _field(dialogs_activity, "currentConnectionState").getInt(dialogs_activity)
+        from .telegram import is_proxy_enabled
+        connected = state in (ConnectionsManager.ConnectionStateConnected, ConnectionsManager.ConnectionStateUpdating)
+        drawable.setConnected(is_proxy_enabled(), connected, False)
+    except Exception:
         pass
 
-class HideProxySponsorDialogHook(MethodHook):
-    _last_hide = {}
 
-    def after_hooked_method(self, param):
-        try:
-            mc = param.thisObject
-            if not mc:
-                return
-
-            proxy_type = 0
+def add_link_spans(spannable, text=None):
+    """Make proxy links in a message clickable. Returns how many spans were added."""
+    if spannable is None or not hasattr(spannable, "setSpan"):
+        return 0
+    text = str(text if text is not None else spannable)
+    try:
+        from android.text import Spanned
+        from android.text.style import URLSpan
+        flags = int(Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+    except Exception:
+        return 0
+    added = 0
+    for start, end, link in links.find_links(text):
+        covered = False
+        for span in list(spannable.getSpans(start, end, URLSpan) or []):
+            url = str(span.getURL() or "").lower()
+            if spannable.getSpanStart(span) <= start and spannable.getSpanEnd(span) >= end and \
+                    url.startswith(_LINK_SCHEMES + ("tg://ws", "tg://relay", "https://hvpn", "https://hitray", "hitvpn")):
+                covered = True
+                break
+        if not covered:
             try:
-                proxy_type = int(getattr(MessagesController, "PROMO_TYPE_PROXY", 0))
-            except:
-                proxy_type = 0
-
-            promo_type = None
-            try:
-                promo_type = int(mc.promoDialogType)
-            except:
-                promo_type = None
-
-            promo_id = 0
-            promo_type_pref = None
-            try:
-                prefs = MessagesController.getGlobalMainSettings()
-                promo_id = int(prefs.getLong("proxy_dialog", 0))
-                promo_type_pref = int(prefs.getInt("promo_dialog_type", -1))
-            except:
-                promo_id = 0
-                promo_type_pref = None
-
-            is_proxy_promo = False
-            if promo_id != 0 and promo_type_pref is not None and promo_type_pref == proxy_type:
-                is_proxy_promo = True
-            elif promo_type is not None and promo_type == proxy_type:
-                is_proxy_promo = True
-
-            if not is_proxy_promo:
-                return
-
-            now = int(time.time())
-            key = id(mc)
-            last = int(HideProxySponsorDialogHook._last_hide.get(key, 0) or 0)
-            if now - last < 30:
-                return
-            HideProxySponsorDialogHook._last_hide[key] = now
-
-            def _hide():
-                try:
-                    from hook_utils import get_private_field, set_private_field
-
-                    promo_dialog = None
-                    try:
-                        promo_dialog = get_private_field(mc, "promoDialog")
-                    except:
-                        promo_dialog = None
-
-                    if promo_dialog is None and promo_id != 0:
-                        try:
-                            promo_dialog = mc.dialogs_dict.get(promo_id)
-                        except:
-                            promo_dialog = None
-                        if promo_dialog is not None:
-                            try:
-                                set_private_field(mc, "promoDialog", promo_dialog)
-                            except:
-                                pass
-
-                    if hasattr(mc, "hidePromoDialog"):
-                        mc.hidePromoDialog()
-                except:
-                    pass
-
-            run_on_ui_thread(_hide)
-        except:
-            pass
+                spannable.setSpan(URLSpan(link), start, end, flags)
+                added += 1
+            except Exception:
+                pass
+    return added
 
 
-class _ForceDialogsProxyButtonHook(MethodHook):
-    def __init__(self, plugin):
-        self._plugin = plugin
-
-    def after_hooked_method(self, param):
-        try:
-            if not self._plugin._active:
-                return
-            if (not self._plugin._is_plugin_proxy_enabled()) or self._plugin._is_proxy_policy_suspended():
-                return
-            _force_show_dialogs_proxy_button(param.thisObject)
-        except:
-            pass
-
-
-class _DialogsShowSearchForceProxyHook(MethodHook):
-    def __init__(self, plugin):
-        self._plugin = plugin
-
-    def after_hooked_method(self, param):
-        try:
-            if not self._plugin._active:
-                return
-            if (not self._plugin._is_plugin_proxy_enabled()) or self._plugin._is_proxy_policy_suspended():
-                return
-            _force_show_dialogs_proxy_button(param.thisObject)
-        except:
-            pass
-
-
-class _DialogsShowDoneItemForceProxyHook(MethodHook):
-    def __init__(self, plugin):
-        self._plugin = plugin
-
-    def after_hooked_method(self, param):
-        try:
-            if not self._plugin._active:
-                return
-            if (not self._plugin._is_plugin_proxy_enabled()) or self._plugin._is_proxy_policy_suspended():
-                return
-            _force_show_dialogs_proxy_button(param.thisObject)
-        except:
-            pass
-
-
-class _ProxySettingsChangedNotifyHook(MethodHook):
-    def __init__(self, plugin):
-        self._plugin = plugin
-
-    def after_hooked_method(self, param):
-        try:
-            if not self._plugin._active:
-                return
-            if not param.args or len(param.args) < 1:
-                return
-
-            try:
-                event_id = int(param.args[0])
-            except:
-                return
-
-            try:
-                network_changed_id = int(getattr(NotificationCenter, "didUpdateConnectionState"))
-            except:
-                network_changed_id = -1
-            if event_id == network_changed_id:
-                threading.Thread(target=self._plugin._apply_vpn_policy, daemon=True).start()
-
-            try:
-                proxy_changed_id = int(NotificationCenter.proxySettingsChanged)
-            except:
-                return
-
-            if event_id != proxy_changed_id:
-                return
-
-            if (
-                self._plugin._is_vless_mode_selected()
-                and self._plugin._is_plugin_proxy_enabled()
-                and not self._plugin._is_proxy_policy_suspended()
-                and not _is_tg_proxy_enabled()
-            ):
-                threading.Thread(target=self._plugin._restore_running_vless_proxy, daemon=True).start()
-            else:
-                self._plugin._refresh_settings_without_reopen()
-            self._plugin._refresh_current_dialogs_proxy_button()
-        except:
-            pass
-
-
-class _ProxyTransitionKillSwitchHook(MethodHook):
-    def __init__(self, plugin):
-        self._plugin = plugin
+class _Hook(MethodHook):
+    def __init__(self, gp, before=None, after=None):
+        self.gp, self._before, self._after = gp, before, after
 
     def before_hooked_method(self, param):
-        try:
-            if not self._plugin._active:
-                return
-            lease = self._plugin._maybe_acquire_proxy_transition_killswitch_from_args(param.args)
-            if lease is None:
-                return
-            self._plugin._remember_proxy_transition_param_lease(param, lease)
-        except:
-            pass
+        if self._before is not None and self.gp.active:
+            try:
+                self._before(param)
+            except Exception:
+                pass
 
     def after_hooked_method(self, param):
-        try:
-            lease = self._plugin._pop_proxy_transition_param_lease(param)
-            if lease is None:
-                return
-            self._plugin._release_proxy_transition_killswitch(
-                lease,
-                delay_sec=float(PROXY_TRANSITION_KILLSWITCH_RESUME_DELAY_SEC),
-            )
-        except:
-            pass
-
-
-class _AwgActivityResultHook(MethodHook):
-    def __init__(self, plugin):
-        self._plugin = plugin
-
-    def before_hooked_method(self, param):
-        try:
-            if not self._plugin._active:
-                return
-            if not param.args or len(param.args) < 3:
-                return
-            req_code = int(param.args[0])
-            res_code = int(param.args[1])
-            data = param.args[2]
-            if res_code != -1 or data is None:
-                return
-            uri = data.getData()
-            if uri is None:
-                return
-            if req_code == int(AWG_FILE_PICKER_REQ):
-                self._plugin._process_awg_file_uri(uri)
-            elif req_code == int(GREENPASS_IMPORT_FILE_PICKER_REQ):
-                self._plugin._process_greenpass_import_file_uri(uri)
-        except:
-            pass
-
-
-class _BrowserOpenUrlHook(MethodHook):
-    def __init__(self, plugin):
-        self._plugin = plugin
-
-    def before_hooked_method(self, param):
-        try:
-            if not self._plugin._active:
-                return
-            if not param.args:
-                return
-
-            raw_url = ""
-            for arg in list(param.args or []):
-                try:
-                    candidate = _extract_import_uri(arg)
-                    if candidate:
-                        raw_url = candidate
-                        break
-                except:
-                    pass
-                try:
-                    if hasattr(arg, "getScheme"):
-                        scheme = str(arg.getScheme() or "").lower()
-                        arg_text = str(arg.toString() or "")
-                        if scheme in tuple(PROXY_URI_SCHEMES) + tuple(QWDTT_URI_SCHEMES) or scheme == "olcrtc" or arg_text.lower().startswith(("qwdtt:config?", "tg://ws", "tg://relay?")):
-                            raw_url = arg_text
-                            break
-                except:
-                    pass
-
-            if not raw_url:
-                return
-
-            run_on_ui_thread(lambda: self._plugin._handle_import_uri(raw_url, confirm=True))
+        if self._after is not None and self.gp.active:
             try:
+                self._after(param)
+            except Exception:
+                pass
+
+
+class Hooks:
+    def __init__(self, gp):
+        self.gp = gp                       # the plugin: hook_all_methods, hook_method, handlers
+        self._installed = set()
+        self._pause_leases = {}
+
+    def _hook_all(self, key, class_name, methods, hook):
+        if key in self._installed:
+            return
+        cls = _cls(class_name)
+        if cls is None:
+            return
+        for method in methods:
+            try:
+                self.gp.hook_all_methods(cls, method, hook)
+                self._installed.add(key)
+            except Exception:
+                continue
+
+    def install(self):
+        gp = self.gp
+        on_button = _Hook(gp, after=lambda p: gp.app.wants_running() and show_proxy_button(p.thisObject))
+        self._hook_all("button", "org.telegram.ui.DialogsActivity", ("updateProxyButton", "showSearch", "showDoneItem"), on_button)
+        self._hook_all("notify", "org.telegram.messenger.NotificationCenter", ("postNotificationName",),
+                       _Hook(gp, after=self._on_notification))
+        self._hook_all("killswitch", "org.telegram.tgnet.ConnectionsManager", ("setProxySettings",),
+                       _Hook(gp, before=self._pause_network, after=self._resume_network))
+        self._hook_all("ipv6", "org.telegram.tgnet.ConnectionsManager", ("checkConnection",),
+                       _Hook(gp, after=lambda p: gp.ipv6_enabled() or gp.force_ipv4()))
+        self._hook_all("browser", "org.telegram.messenger.browser.Browser", ("openUrl",), _Hook(gp, before=self._open_url))
+        self._hook_all("relay-intent", "org.telegram.ui.LaunchActivity", ("handleIntent",), _Hook(gp, before=self._relay_intent))
+        self._hook_all("text", "org.telegram.messenger.AndroidUtilities", ("addLinksSafe", "addLinks"),
+                       _Hook(gp, after=lambda p: p.args and links.contains_link(str(p.args[0] or "")) and add_link_spans(p.args[0])))
+        cell_hook = _Hook(gp, after=self._message_cell)
+        self._hook_all("cell", "org.telegram.ui.Cells.ChatMessageCell", ("setMessageObject",), cell_hook)
+        self._hook_all("action-cell", "org.telegram.ui.Cells.ChatActionCell", ("setMessageObject",), cell_hook)
+        self._hook_all("file", "org.telegram.messenger.AndroidUtilities", ("openForView",), _Hook(gp, before=self._open_file))
+        self._hook_all("webrtc", "org.telegram.messenger.voip.NativeInstance", ("setJoinResponsePayload",),
+                       _Hook(gp, before=self._rewrite_join))
+        endpoint_class = _cls("org.telegram.messenger.voip.Instance$Endpoint")
+        if endpoint_class is not None:
+            self._hook_all("voip", "org.telegram.messenger.voip.Instance", ("makeInstance",),
+                           _Hook(gp, before=lambda p: len(p.args) >= 4 and gp.relay.rewrite_endpoints(p.args[3], endpoint_class)))
+        self._install_activity_result()
+
+    def _install_activity_result(self):
+        if "activity" in self._installed:
+            return
+        try:
+            from java.lang import Integer
+            launch = _cls("org.telegram.ui.LaunchActivity")
+            intent = _cls("android.content.Intent")
+            method = launch.getClass().getDeclaredMethod("onActivityResult", Integer.TYPE, Integer.TYPE, intent)
+            self.gp.hook_method(method, _Hook(self.gp, before=self._activity_result))
+            self._installed.add("activity")
+        except Exception:
+            pass
+
+    # --- handlers ---
+
+    def _on_notification(self, param):
+        event = int(param.args[0]) if param.args else -1
+        if event == int(getattr(NotificationCenter, "didUpdateConnectionState", -2)):
+            self.gp.app.apply_network_policy_async()
+        elif event == int(NotificationCenter.proxySettingsChanged):
+            self.gp.on_telegram_proxy_changed()
+
+    def _pause_network(self, param):
+        # Pause every connection while Telegram switches proxies, so nothing
+        # leaks out directly between the old and the new setting.
+        if param.args and len(param.args) >= 2:
+            self._pause_leases[id(param)] = self.gp.app.network_pause.pause()
+
+    def _resume_network(self, param):
+        lease = self._pause_leases.pop(id(param), None)
+        if lease is not None:
+            self.gp.app.network_pause.release(lease, 0.12)
+
+    def _open_url(self, param):
+        for arg in list(param.args or []):
+            url = links.first_import_link(arg) if isinstance(arg, str) else ""
+            if not url and hasattr(arg, "getScheme"):
+                text = str(arg.toString() or "")
+                if str(arg.getScheme() or "").lower() in _LINK_SCHEMES or text.lower().startswith(("qwdtt:config?", "tg://ws", "tg://relay?")):
+                    url = text
+                else:
+                    url = links.first_import_link(text)
+            if url:
+                from .android import on_ui
+                on_ui(lambda: self.gp.handle_link(url, confirm=True))
                 param.setResult(None)
-            except:
-                try:
-                    param.result = None
-                except:
-                    pass
-        except:
-            pass
-
-
-class _VoipRelayLinkIntentHook(MethodHook):
-    def __init__(self, plugin):
-        self._plugin = plugin
-
-    def before_hooked_method(self, param):
-        try:
-            if not self._plugin._active or not param.args:
                 return
-            intent = param.args[0]
-            if intent is None or str(intent.getAction()) != "android.intent.action.VIEW":
-                return
-            uri = str(intent.getData() or "")
-            if not uri.lower().startswith("tg://relay?"):
-                return
+
+    def _relay_intent(self, param):
+        intent = param.args[0] if param.args else None
+        if intent is None or str(intent.getAction()) != "android.intent.action.VIEW":
+            return
+        uri = str(intent.getData() or "")
+        if uri.lower().startswith("tg://relay?"):
             param.setResult(None)
-            run_on_ui_thread(lambda: self._plugin._handle_import_uri(uri))
-        except:
-            pass
+            from .android import on_ui
+            on_ui(lambda: self.gp.handle_link(uri))
+
+    def _message_cell(self, param):
+        message = param.args[0] if param.args else None
+        if message is None:
+            return
+        added = 0
+        for attr in ("messageText", "caption", "linkDescription"):
+            value = getattr(message, attr, None)
+            if value is not None:
+                added += add_link_spans(value)
+        if added:
+            param.thisObject.invalidate()
+
+    def _open_file(self, param):
+        if param.args and self.gp.open_document(param.args[0]):
+            param.setResult(False)
+
+    def _rewrite_join(self, param):
+        if param.args:
+            param.args[0] = self.gp.relay.rewrite_group_call_join(param.args[0])
+
+    def _activity_result(self, param):
+        if len(param.args or []) < 3:
+            return
+        request, result, data = int(param.args[0]), int(param.args[1]), param.args[2]
+        if result != -1 or data is None or data.getData() is None:
+            return
+        if request in (AWG_FILE_PICKER_REQ, IMPORT_FILE_PICKER_REQ):
+            self.gp.on_file_picked(request, data.getData())
 
 
-class _AddVlessTextLinksHook(MethodHook):
-    def __init__(self, plugin):
-        self._plugin = plugin
-
-    def after_hooked_method(self, param):
-        try:
-            if not self._plugin._active:
-                return
-            if not param.args:
-                return
-            target = param.args[0]
-            if target is None:
-                return
-            try:
-                raw = str(target or "")
-            except:
-                raw = ""
-            if not _contains_import_uri_text(raw):
-                return
-            _ensure_vless_url_spans(target, raw_text=raw)
-        except:
-            pass
-
-
-class _BindVlessTextLinksHook(MethodHook):
-    def __init__(self, plugin):
-        self._plugin = plugin
-
-    def after_hooked_method(self, param):
-        try:
-            if not self._plugin._active:
-                return
-            if not param.args:
-                return
-            message_object = param.args[0]
-            if message_object is None:
-                return
-
-            applied = 0
-            for attr_name in ("messageText", "caption", "linkDescription"):
+def hide_proxy_sponsor():
+    """Hide the "proxy sponsor" chat Telegram pins when a proxy is used."""
+    try:
+        from org.telegram.messenger import UserConfig
+        prefs = MessagesController.getGlobalMainSettings()
+        if int(prefs.getLong("proxy_dialog", 0)) == 0 or \
+                int(prefs.getInt("promo_dialog_type", -1)) != int(getattr(MessagesController, "PROMO_TYPE_PROXY", 0)):
+            return
+        for account in range(int(UserConfig.MAX_ACCOUNT_COUNT)):
+            controller = MessagesController.getInstance(account)
+            if controller is not None and hasattr(controller, "hidePromoDialog"):
                 try:
-                    value = getattr(message_object, attr_name, None)
-                except:
-                    value = None
-                if value is None:
-                    continue
-                try:
-                    applied += int(_ensure_vless_url_spans(value))
-                except:
+                    controller.hidePromoDialog()
+                except Exception:
                     pass
-
-            if applied > 0:
-                try:
-                    param.thisObject.invalidate()
-                except:
-                    pass
-        except:
-            pass
+    except Exception:
+        pass
 
 
-class _GreenPassOpenForViewHook(MethodHook):
-    def __init__(self, plugin):
-        self._plugin = plugin
-
-    def before_hooked_method(self, param):
-        try:
-            if not self._plugin._active:
-                return
-            if not param.args:
-                return
-            message_object = param.args[0]
-            if message_object is None:
-                return
-            if self._plugin._handle_greenpass_file_open(message_object):
-                try:
-                    param.setResult(False)
-                except:
-                    try:
-                        param.result = False
-                    except:
-                        pass
-        except:
-            pass
+_last_sponsor_hide = [0.0]
 
 
-class _VoipEndpointRewriteHook(MethodHook):
-    def __init__(self, plugin, endpoint_cls):
-        self._plugin = plugin
-        self._endpoint_cls = endpoint_cls
-
-    def before_hooked_method(self, param):
-        try:
-            if not self._plugin._active or not param.args or len(param.args) < 4:
-                return
-            self._plugin._rewrite_voip_endpoints(param.args[3], self._endpoint_cls)
-        except:
-            pass
-
-
-class _WebRtcJoinResponseRewriteHook(MethodHook):
-    def __init__(self, plugin):
-        self._plugin = plugin
-
-    def before_hooked_method(self, param):
-        try:
-            if not self._plugin._active or not param.args:
-                return
-            param.args[0] = self._plugin._rewrite_webrtc_join_response(param.args[0])
-        except:
-            pass
-
-class _Ipv6PolicyHook(MethodHook):
-    def __init__(self, plugin):
-        self._plugin = plugin
-
-    def after_hooked_method(self, param):
-        try:
-            if self._plugin._active and not self._plugin._ipv6_enabled():
-                self._plugin._force_ipv4_strategy()
-        except:
-            pass
-
-
-__all__ = [name for name in globals() if not name.startswith("__")]
+def hide_proxy_sponsor_throttled():
+    if time.monotonic() - _last_sponsor_hide[0] >= 30:
+        _last_sponsor_hide[0] = time.monotonic()
+        from .android import on_ui
+        on_ui(hide_proxy_sponsor)

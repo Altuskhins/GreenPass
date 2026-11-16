@@ -1,4 +1,258 @@
-from .foundation import *
+"""TG WS: a local MTProto proxy that carries Telegram over WebSocket to Telegram's
+own web endpoints, with Cloudflare-fronted fallbacks.
+
+Threaded port of Flowseal/tg-ws-proxy (MIT); the HTTP/2 media path is tgws_cf_h2.
+"""
+
+import base64
+import hashlib
+import json
+import os
+import random
+import re
+import socket
+import ssl
+import struct
+import threading
+import time
+import types
+import urllib.request
+
+try:
+    from javax.crypto import Cipher as JavaCipher
+    from javax.crypto.spec import IvParameterSpec, SecretKeySpec
+except Exception:                       # outside the app (tests)
+    JavaCipher = SecretKeySpec = IvParameterSpec = None
+
+LOCAL_HOST = "127.0.0.1"
+
+TGWS_KIND = "tgws"
+
+TGWS_LOCAL_PORT = 10805
+
+TGWS_BRIDGE_IDLE_TIMEOUT_SEC = 3600.0
+
+TGWS_WS_CONNECT_TIMEOUT_SEC = 5.0
+
+TGWS_WS_FAIL_TIMEOUT_SEC = 2.0
+
+TGWS_WS_FAIL_COOLDOWN_SEC = 60.0
+
+TGWS_IP_FAIL_COOLDOWN_SEC = 3600.0
+
+TGWS_WS_BLACKLIST_TTL_SEC = 420.0
+
+TGWS_CFPROXY_CONNECT_TIMEOUT_SEC = 8.0
+
+TGWS_CFPROXY_429_COOLDOWN_SEC = 45.0
+
+TGWS_WS_POOL_SIZE = 4
+
+TGWS_WS_POOL_CONNECT_TIMEOUT_SEC = 8.0
+
+TGWS_WS_POOL_MAX_AGE_SEC = 120.0
+
+TGWS_WS_POOL_CHECK_INTERVAL_SEC = 5.0
+
+TGWS_WS_POOL_REFILL_BACKOFF_INITIAL_SEC = 1.0
+
+TGWS_WS_POOL_REFILL_BACKOFF_MAX_SEC = 3600.0
+
+TGWS_LISTENER_RESTART_DELAY_SEC = 1.0
+
+TGWS_FRONTING_SNI = "sprinthost.ru"
+
+TGWS_PROXY_SECRET_HEX = "00000000000000000000000000000000"
+
+TGWS_SOCKET_BUFFER_SIZE = 256 * 1024
+
+TGWS_DEFAULT_DC_IP = {
+    "2": "149.154.167.220",
+    "4": "149.154.167.220",
+}
+
+TGWS_WS_PATH = "/apiws"
+
+TGWS_WS_PATH_TEST = "/apiws_test"
+
+TGWS_TEST_DC_OFFSET = 10000
+
+TGWS_TEST_DC_IP = {
+    "1": "149.154.175.10",
+    "2": "149.154.167.40",
+    "3": "149.154.175.117",
+}
+
+TGWS_DIRECT_FALLBACK_IP = {
+    "1": "149.154.175.50",
+    "2": "149.154.167.51",
+    "3": "149.154.175.100",
+    "4": "149.154.167.91",
+    "5": "149.154.171.5",
+    "203": "91.105.192.100",
+}
+
+TGWS_CFPROXY_ENABLED = True
+
+TGWS_CFPROXY_PRIORITY = False
+
+TGWS_CFPROXY_DISABLE_SECURE = False
+
+TGWS_CFPROXY_WORKER_DOMAIN = ""
+
+TGWS_CFPROXY_DOMAINS_URL = (
+    "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main"
+    "/.github/cfproxy-domains.txt"
+)
+
+TGWS_CFPROXY_MIN_VALID_DOMAINS = 3
+
+TGWS_CFPROXY_REFRESH_INTERVAL_SEC = 12 * 3600.0
+
+_TGWS_CFPROXY_ENC = [
+    "virkgj.com",
+    "vmmzovy.com",
+    "mkuosckvso.com",
+    "zaewayzmplad.com",
+    "twdmbzcm.com",
+    "awzwsldi.com",
+    "clngqrflngqin.com",
+    "tjacxbqtj.com",
+    "bxaxtxmrw.com",
+    "dmohrsgmohcrwb.com",
+    "vwbmtmoi.com",
+    "khgrre.com",
+    "ulihssf.com",
+    "tmhqsdqmfpmk.com",
+    "xwuwoqbm.com",
+    "orgcnunpj.com",
+    "zhkuldz.com",
+    "zypoljnslxa.com",
+    "efabnxaowuzs.com",
+    "zaftuzsftqdq.com",
+]
+
+_TGWS_CFPROXY_SUFFIX = "".join(chr(c) for c in (46, 99, 111, 46, 117, 107))
+
+def _tgws_dd(s):
+    try:
+        s = str(s or "")
+        if s[-4:] != ".com":
+            return s
+        prefix = s[:-4]
+        n = sum(1 for c in prefix if c.isalpha())
+        out = []
+        for c in prefix:
+            if c.isalpha():
+                base = 97 if c > "`" else 65
+                out.append(chr((ord(c) - base - n) % 26 + base))
+            else:
+                out.append(c)
+        return "".join(out) + _TGWS_CFPROXY_SUFFIX
+    except:
+        return str(s or "")
+
+def _tgws_is_valid_domain(domain):
+    try:
+        domain = str(domain or "")
+        if not domain or len(domain) > 253:
+            return False
+        if domain.startswith(".") or domain.endswith("."):
+            return False
+        labels = domain.split(".")
+        if len(labels) < 2:
+            return False
+        for label in labels:
+            if not label or len(label) > 63:
+                return False
+            if label[0] == "-" or label[-1] == "-":
+                return False
+            if not all(ch.isalnum() or ch == "-" for ch in label):
+                return False
+        tld = labels[-1]
+        if len(tld) < 2 or not any(ch.isalpha() for ch in tld):
+            return False
+        return True
+    except:
+        return False
+
+def _tgws_normalize_domain_pool(domains):
+    seen = set()
+    normalized = []
+    try:
+        for domain in list(domains or []):
+            item = str(domain or "").strip().lower()
+            if not _tgws_is_valid_domain(item):
+                continue
+            if item in seen:
+                continue
+            seen.add(item)
+            normalized.append(item)
+    except:
+        pass
+    return normalized
+
+def _tgws_fetch_cfproxy_domains(timeout=10.0):
+    try:
+        bust = "".join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(7))
+        url = TGWS_CFPROXY_DOMAINS_URL + "?" + bust
+        req = urllib.request.Request(url, headers={"User-Agent": "tg-ws-proxy"})
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=float(timeout), context=ctx) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+        encoded = [
+            line.strip() for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        return [_tgws_dd(d) for d in encoded]
+    except Exception:
+        return []
+
+TGWS_CFPROXY_DEFAULT_DOMAINS = _tgws_normalize_domain_pool([_tgws_dd(d) for d in _TGWS_CFPROXY_ENC])
+
+_TGWS_TG_RANGES = [
+    (struct.unpack("!I", socket.inet_aton("185.76.151.0"))[0], struct.unpack("!I", socket.inet_aton("185.76.151.255"))[0]),
+    (struct.unpack("!I", socket.inet_aton("149.154.160.0"))[0], struct.unpack("!I", socket.inet_aton("149.154.175.255"))[0]),
+    (struct.unpack("!I", socket.inet_aton("91.105.192.0"))[0], struct.unpack("!I", socket.inet_aton("91.105.193.255"))[0]),
+    (struct.unpack("!I", socket.inet_aton("91.108.0.0"))[0], struct.unpack("!I", socket.inet_aton("91.108.255.255"))[0]),
+]
+
+_TGWS_IP_TO_DC = {
+    "149.154.175.50": (1, False),
+    "149.154.175.51": (1, False),
+    "149.154.175.53": (1, False),
+    "149.154.175.54": (1, False),
+    "149.154.175.52": (1, True),
+    "149.154.167.41": (2, False),
+    "149.154.167.50": (2, False),
+    "149.154.167.51": (2, False),
+    "149.154.167.220": (2, False),
+    "95.161.76.100": (2, False),
+    "149.154.167.151": (2, True),
+    "149.154.167.222": (2, True),
+    "149.154.167.223": (2, True),
+    "149.154.162.123": (2, True),
+    "149.154.175.100": (3, False),
+    "149.154.175.101": (3, False),
+    "149.154.175.102": (3, True),
+    "149.154.167.91": (4, False),
+    "149.154.167.92": (4, False),
+    "149.154.164.250": (4, True),
+    "149.154.166.120": (4, True),
+    "149.154.166.121": (4, True),
+    "149.154.167.118": (4, True),
+    "149.154.165.111": (4, True),
+    "91.108.56.100": (5, False),
+    "91.108.56.101": (5, False),
+    "91.108.56.116": (5, False),
+    "91.108.56.126": (5, False),
+    "149.154.171.5": (5, False),
+    "91.108.56.102": (5, True),
+    "91.108.56.128": (5, True),
+    "91.108.56.151": (5, True),
+    "91.105.192.100": (203, False),
+}
+
 import asyncio
 import importlib
 import logging
@@ -1497,7 +1751,7 @@ class TgWsCore:
         try:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             _tgws_set_socket_options(listener)
-            listener.bind((VLESS_LOCAL_HOST, int(port)))
+            listener.bind((LOCAL_HOST, int(port)))
             listener.listen(32)
             listener.settimeout(1.0)
             return listener
