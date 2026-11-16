@@ -14,7 +14,7 @@ VERSION = __version__
 
 # Updates are ordered by this build id, not by the shown version: bump it by one
 # for every release. Releases are tagged v<version>-b<build>.
-GREENPASS_BUILD = 14
+GREENPASS_BUILD = 1
 
 RELEASES_LATEST_URL = "https://api.github.com/repos/Altuskhins/GreenPass/releases/latest"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 60 * 60
